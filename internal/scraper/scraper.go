@@ -10,14 +10,27 @@ import (
 	"github.com/boettiger-lab/nimbus-carbon-api/internal/prom"
 )
 
-// ModelMetrics holds the latest carbon and performance metrics for one LLM model.
+// nimbus is a single node with exactly one physical GPU (a GB10) and one
+// serving container ("vllm", shared by every model deployment — see
+// boettiger-lab/k8s/vllm/nimbus/deploy-*.yaml). These are fixed facts, not
+// queried, unlike nrp-carbon-api which discovers GPU count/hardware and
+// container name per pod across many nodes.
+const (
+	nimbusNamespace   = "default"
+	nimbusGPUCount    = 1
+	nimbusGPUHardware = "NVIDIA GB10"
+	nimbusContainer   = "vllm"
+)
+
+// ModelMetrics holds the latest carbon and performance metrics for the
+// currently-active model on nimbus.
 type ModelMetrics struct {
 	// Identity
-	ModelName  string `json:"model_name"`
-	Namespace  string `json:"namespace"`
-	Container  string `json:"container"`
-	GPUHardware string `json:"gpu_hardware"` // e.g. "A100-SXM4-80GB"
-	Node       string `json:"node"`
+	ModelName   string `json:"model_name"`
+	Namespace   string `json:"namespace"`
+	Container   string `json:"container"`
+	GPUHardware string `json:"gpu_hardware"`
+	Node        string `json:"node"`
 
 	// Raw
 	GPUCount               int     `json:"gpu_count"`
@@ -27,14 +40,13 @@ type ModelMetrics struct {
 	TokensPerSec           float64 `json:"tokens_per_sec"`            // total = prompt + generation
 
 	// Carbon
-	CarbonIntensity      float64 `json:"carbon_intensity_kg_per_kwh"`        // grid intensity used
-	CO2GramsPerHour      float64 `json:"co2_grams_per_hour"`
-	CO2MgPerToken        float64 `json:"co2_mg_per_token,omitempty"`          // 0 when idle (5-min window, ≥5 tok/s)
-	CO2MgPerTokenAvg24h  float64 `json:"co2_mg_per_token_avg_24h,omitempty"`  // token-weighted 24h mean, active periods only
-	CO2MgPerTokenAvg7d   float64 `json:"co2_mg_per_token_avg_7d,omitempty"`   // token-weighted 7-day mean, active periods only
+	CarbonIntensity     float64 `json:"carbon_intensity_kg_per_kwh"`
+	CO2GramsPerHour     float64 `json:"co2_grams_per_hour"`
+	CO2MgPerToken       float64 `json:"co2_mg_per_token,omitempty"`         // 0 when idle (5-min window, ≥5 tok/s)
+	CO2MgPerTokenAvg24h float64 `json:"co2_mg_per_token_avg_24h,omitempty"` // token-weighted 24h mean, active periods only
+	CO2MgPerTokenAvg7d  float64 `json:"co2_mg_per_token_avg_7d,omitempty"`  // token-weighted 7-day mean, active periods only
 
-	// Time-weighted 24h means (all samples, active + idle). Used for apples-to-apples
-	// "vs commercial frontier" comparison on the card over the same window as the bar chart.
+	// Time-weighted 24h means (all samples, active + idle).
 	PowerWattsAvg24h             float64 `json:"power_watts_avg_24h,omitempty"`
 	PromptTokensPerSecAvg24h     float64 `json:"prompt_tokens_per_sec_avg_24h,omitempty"`
 	GenerationTokensPerSecAvg24h float64 `json:"generation_tokens_per_sec_avg_24h,omitempty"`
@@ -52,23 +64,23 @@ type dataPoint struct {
 // (active samples only) plus time-weighted means for power, prompt tok/s,
 // and generation tok/s (every reporting sample, active or idle).
 type avgBucket struct {
-	Hour         int64   // Unix timestamp truncated to hour
-	WeightedSum  float64 // Σ(co2_per_token_i × tokens_per_sec_i), active samples
-	TokenSum     float64 // Σ(tokens_per_sec_i), active samples
-	PowerSum     float64 // Σ power_watts_i, all reporting samples
-	PromptTokSum float64 // Σ prompt_tokens_per_sec_i, all reporting samples
-	GenTokSum    float64 // Σ generation_tokens_per_sec_i, all reporting samples
-	SampleCount  int     // number of reporting samples contributing to the *Sum fields
+	Hour         int64
+	WeightedSum  float64
+	TokenSum     float64
+	PowerSum     float64
+	PromptTokSum float64
+	GenTokSum    float64
+	SampleCount  int
 }
 
-const maxBuckets = 168  // 7 days of hourly buckets
-const maxHistory = 20160 // 7 days at 30s scrape intervals (for Series endpoint ring buffers)
+const maxBuckets = 168    // 7 days of hourly buckets
+const maxHistory = 20160  // 7 days at 30s scrape intervals (for Series endpoint ring buffers)
 
 type modelHistory struct {
-	PowerWatts      []dataPoint // ring buffer for Series endpoint
-	CO2GramsPerHour []dataPoint // ring buffer for Series endpoint
-	CO2MgPerToken   []dataPoint // ring buffer for Series endpoint
-	AvgBuckets      []avgBucket // hourly aggregates for token-weighted averaging
+	PowerWatts      []dataPoint
+	CO2GramsPerHour []dataPoint
+	CO2MgPerToken   []dataPoint
+	AvgBuckets      []avgBucket
 }
 
 func (h *modelHistory) append(now time.Time, m *ModelMetrics) {
@@ -86,10 +98,6 @@ func (h *modelHistory) append(now time.Time, m *ModelMetrics) {
 	h.addSample(now, m.PowerWatts, m.PromptTokensPerSec, m.GenerationTokensPerSec, m.CarbonIntensity)
 }
 
-// addSample accumulates one scrape sample into the hourly aggregate bucket for time t.
-// Every sample with power > 0 contributes to the time-weighted power/tok-rate sums.
-// Active samples (prompt+gen > 5 tok/s) additionally contribute to the token-weighted
-// CO₂/token sums.
 func (h *modelHistory) addSample(t time.Time, power, promptTok, genTok, intensity float64) {
 	if power <= 0 {
 		return
@@ -128,13 +136,14 @@ func (h *modelHistory) addSample(t time.Time, power, promptTok, genTok, intensit
 	}
 }
 
-// Scraper polls Prometheus and maintains in-memory state.
+// Scraper polls Prometheus and maintains in-memory state. Keyed by
+// namespace alone (always "default" on nimbus) — see package comment.
 type Scraper struct {
 	client   *prom.Client
 	interval time.Duration
 
 	mu      sync.RWMutex
-	models  map[string]*ModelMetrics // key: namespace/container
+	models  map[string]*ModelMetrics
 	history map[string]*modelHistory
 }
 
@@ -147,10 +156,9 @@ func New(promURL string, interval time.Duration) *Scraper {
 	}
 }
 
-// Run starts the background scrape loop. Call in a goroutine.
 func (s *Scraper) Run() {
-	s.scrape()   // first scrape populates models with current intensities
-	s.backfill() // seed hourly buckets from Prometheus history
+	s.scrape()
+	s.backfill()
 	t := time.NewTicker(s.interval)
 	defer t.Stop()
 	for range t.C {
@@ -159,8 +167,8 @@ func (s *Scraper) Run() {
 }
 
 // backfill queries Prometheus for 7 days of historical power and token data
-// and seeds the hourly average buckets so that 24h/7d averages are immediately
-// correct after a restart, rather than starting from zero.
+// and seeds the hourly average buckets so that 24h/7d averages are
+// immediately correct after a restart, rather than starting from zero.
 func (s *Scraper) backfill() {
 	log.Println("scraper: backfilling 7-day averages from Prometheus...")
 	end := time.Now()
@@ -168,7 +176,7 @@ func (s *Scraper) backfill() {
 	step := 5 * time.Minute
 
 	powerSeries, err := s.client.RangeQuery(
-		`sum by (namespace, container) (DCGM_FI_DEV_POWER_USAGE{namespace=~"nrp-llm|sdsc-llm"})`,
+		`sum by (namespace) (DCGM_FI_DEV_POWER_USAGE{namespace="default"})`,
 		start, end, step,
 	)
 	if err != nil {
@@ -176,7 +184,7 @@ func (s *Scraper) backfill() {
 		return
 	}
 	promptSeries, err := s.client.RangeQuery(
-		`sum by (namespace, container) (rate(vllm:prompt_tokens_total[5m]))`,
+		`sum by (namespace) (rate(vllm:prompt_tokens_total{namespace="default"}[5m]))`,
 		start, end, step,
 	)
 	if err != nil {
@@ -184,7 +192,7 @@ func (s *Scraper) backfill() {
 		return
 	}
 	genSeries, err := s.client.RangeQuery(
-		`sum by (namespace, container) (rate(vllm:generation_tokens_total[5m]))`,
+		`sum by (namespace) (rate(vllm:generation_tokens_total{namespace="default"}[5m]))`,
 		start, end, step,
 	)
 	if err != nil {
@@ -192,12 +200,11 @@ func (s *Scraper) backfill() {
 		return
 	}
 
-	// Join power and token data by (key, timestamp).
 	type sample struct{ power, promptTok, genTok float64 }
 	byKeyTime := make(map[string]map[int64]*sample)
 
 	for _, sr := range powerSeries {
-		key := sr.Metric["namespace"] + "/" + sr.Metric["container"]
+		key := sr.Metric["namespace"]
 		if byKeyTime[key] == nil {
 			byKeyTime[key] = make(map[int64]*sample)
 		}
@@ -210,7 +217,7 @@ func (s *Scraper) backfill() {
 		}
 	}
 	for _, sr := range promptSeries {
-		key := sr.Metric["namespace"] + "/" + sr.Metric["container"]
+		key := sr.Metric["namespace"]
 		if byKeyTime[key] == nil {
 			byKeyTime[key] = make(map[int64]*sample)
 		}
@@ -223,7 +230,7 @@ func (s *Scraper) backfill() {
 		}
 	}
 	for _, sr := range genSeries {
-		key := sr.Metric["namespace"] + "/" + sr.Metric["container"]
+		key := sr.Metric["namespace"]
 		if byKeyTime[key] == nil {
 			byKeyTime[key] = make(map[int64]*sample)
 		}
@@ -236,23 +243,10 @@ func (s *Scraper) backfill() {
 		}
 	}
 
-	// Use current carbon intensities from the first live scrape.
-	s.mu.RLock()
-	intensityByKey := make(map[string]float64, len(s.models))
-	for key, m := range s.models {
-		intensityByKey[key] = m.CarbonIntensity
-	}
-	s.mu.RUnlock()
-
-	// Populate hourly average buckets.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for key, timestamps := range byKeyTime {
-		intensity := intensityByKey[key]
-		if intensity == 0 {
-			intensity = carbon.NRPDefault
-		}
 		if s.history[key] == nil {
 			s.history[key] = &modelHistory{}
 		}
@@ -261,11 +255,11 @@ func (s *Scraper) backfill() {
 			if samp.power <= 0 {
 				continue
 			}
-			h.addSample(time.Unix(ts, 0), samp.power, samp.promptTok, samp.genTok, intensity)
+			h.addSample(time.Unix(ts, 0), samp.power, samp.promptTok, samp.genTok, carbon.BerkeleyIntensity)
 		}
 	}
 
-	log.Printf("scraper: backfilled %d model(s) from Prometheus", len(byKeyTime))
+	log.Printf("scraper: backfilled %d key(s) from Prometheus", len(byKeyTime))
 }
 
 // Models returns a snapshot of all current model metrics.
@@ -280,12 +274,15 @@ func (s *Scraper) Models() []*ModelMetrics {
 	return out
 }
 
-// Series returns the history for a model/metric combination.
+// Series returns the history for a namespace/metric combination.
+// container is accepted for API-compatibility with the
+// /api/v1/carbon/{ns}/{container}/{metric} route but is otherwise unused —
+// nimbus has exactly one container ("vllm") per namespace, always.
 // metric is one of "power_watts", "co2_grams_per_hour", "co2_mg_per_token".
 func (s *Scraper) Series(namespace, container, metric string, since time.Duration) [][2]interface{} {
-	key := namespace + "/" + container
+	_ = container
 	s.mu.RLock()
-	h, ok := s.history[key]
+	h, ok := s.history[namespace]
 	s.mu.RUnlock()
 	if !ok {
 		return nil
@@ -316,25 +313,16 @@ func (s *Scraper) Series(namespace, container, metric string, since time.Duratio
 // ---- internal ----
 
 func (s *Scraper) scrape() {
-	// 1. GPU power per pod (namespace + container)
-	powerByKey, nodeByKey, err := s.queryPower()
+	powerByKey, err := s.queryPower()
 	if err != nil {
 		log.Printf("scraper: power query failed: %v", err)
 	}
 
-	// 2. GPU count + hardware model per pod
-	gpuByKey, hardwareByKey, err := s.queryGPUInfo()
-	if err != nil {
-		log.Printf("scraper: gpu info query failed: %v", err)
-	}
-
-	// 3. Token generation and prompt rates per pod
 	genTokensByKey, promptTokensByKey, modelNameByKey, err := s.queryTokens()
 	if err != nil {
 		log.Printf("scraper: token query failed: %v", err)
 	}
 
-	// Union of all known model keys
 	keys := make(map[string]struct{})
 	for k := range powerByKey {
 		keys[k] = struct{}{}
@@ -351,34 +339,27 @@ func (s *Scraper) scrape() {
 	defer s.mu.Unlock()
 
 	for key := range keys {
-		ns, container := splitKey(key)
 		power := powerByKey[key]
-		node := nodeByKey[key]
-		intensity := carbon.IntensityForNode(node, ns)
+		intensity := carbon.BerkeleyIntensity
 
-		genTok    := genTokensByKey[key]
+		genTok := genTokensByKey[key]
 		promptTok := promptTokensByKey[key]
-		totalTok  := genTok + promptTok
+		totalTok := genTok + promptTok
 		modelName := modelNameByKey[key]
-		gpuCount  := gpuByKey[key]
-		hw        := hardwareByKey[key]
 
 		co2PerHour := carbon.GramsPerHour(power, intensity)
 		co2PerToken := 0.0
 		if totalTok > 5.0 {
-			// CO₂/token uses total tokens (prompt + generation) as denominator:
-			// both prefill and decode phases consume GPU energy, and agentic
-			// workloads are dominated by large prompt (input) token counts.
 			co2PerToken = carbon.MgPerToken(power, intensity, totalTok)
 		}
 
 		m := &ModelMetrics{
 			ModelName:              modelName,
-			Namespace:              ns,
-			Container:              container,
-			GPUHardware:            hw,
-			Node:                   node,
-			GPUCount:               gpuCount,
+			Namespace:              key,
+			Container:              nimbusContainer,
+			GPUHardware:            nimbusGPUHardware,
+			Node:                   "nimbus",
+			GPUCount:               nimbusGPUCount,
 			PowerWatts:             math.Round(power*10) / 10,
 			PromptTokensPerSec:     math.Round(promptTok*10) / 10,
 			GenerationTokensPerSec: math.Round(genTok*10) / 10,
@@ -399,8 +380,6 @@ func (s *Scraper) scrape() {
 		h := s.history[key]
 		h.append(now, m)
 
-		// Token-weighted CO₂/token averages (active samples) and time-weighted
-		// power / prompt-tok/s / gen-tok/s averages (all samples) from hourly buckets.
 		var wSum24, tSum24, wSum7d, tSum7d float64
 		var powSum24, promptSum24, genSum24 float64
 		var nSum24 int
@@ -417,7 +396,7 @@ func (s *Scraper) scrape() {
 				powSum24 += b.PowerSum
 				promptSum24 += b.PromptTokSum
 				genSum24 += b.GenTokSum
-				nSum24 += b.SampleCount
+				nSum24++
 			}
 		}
 		if tSum24 > 0 {
@@ -435,63 +414,34 @@ func (s *Scraper) scrape() {
 	}
 }
 
-// queryPower returns total GPU power (W) keyed by "namespace/container".
-// Also returns the node hostname (Hostname label) for carbon intensity lookup.
-func (s *Scraper) queryPower() (map[string]float64, map[string]string, error) {
-	// Include Hostname in the aggregation — all GPUs in a pod share the same node.
+// queryPower returns total GPU power (W) keyed by namespace.
+func (s *Scraper) queryPower() (map[string]float64, error) {
 	results, err := s.client.Query(
-		`sum by (namespace, container, Hostname) (avg_over_time(DCGM_FI_DEV_POWER_USAGE{namespace=~"nrp-llm|sdsc-llm"}[5m]))`,
+		`sum by (namespace) (avg_over_time(DCGM_FI_DEV_POWER_USAGE{namespace="default"}[5m]))`,
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	power := make(map[string]float64)
-	nodes := make(map[string]string)
 	for _, r := range results {
-		key := r.Metric["namespace"] + "/" + r.Metric["container"]
-		power[key] += r.Value
-		if nodes[key] == "" {
-			nodes[key] = r.Metric["Hostname"]
-		}
+		power[r.Metric["namespace"]] += r.Value
 	}
-	return power, nodes, nil
+	return power, nil
 }
 
-// queryGPUInfo returns GPU count and hardware model keyed by "namespace/container".
-func (s *Scraper) queryGPUInfo() (map[string]int, map[string]string, error) {
-	results, err := s.client.Query(
-		`count by (namespace, container, modelName) (DCGM_FI_DEV_GPU_UTIL{namespace=~"nrp-llm|sdsc-llm"})`,
-	)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	counts := make(map[string]int)
-	hardware := make(map[string]string)
-	for _, r := range results {
-		key := r.Metric["namespace"] + "/" + r.Metric["container"]
-		counts[key] += int(r.Value)
-		if hardware[key] == "" {
-			hardware[key] = r.Metric["modelName"]
-		}
-	}
-	return counts, hardware, nil
-}
-
-// queryTokens returns 5-minute prompt and generation token rates keyed by "namespace/container".
-// Also returns the LLM model_name label.
-// Prompt tokens (prefill/input) and generation tokens (decode/output) are returned separately
-// so callers can track agentic workloads where input tokens dominate.
+// queryTokens returns 5-minute prompt and generation token rates keyed by
+// namespace, plus the vLLM model_name label for whichever model is
+// currently reporting traffic.
 func (s *Scraper) queryTokens() (genTokens, promptTokens map[string]float64, names map[string]string, err error) {
 	genResults, err := s.client.Query(
-		`sum by (namespace, container, model_name) (rate(vllm:generation_tokens_total[5m]))`,
+		`sum by (namespace, model_name) (rate(vllm:generation_tokens_total{namespace="default"}[5m]))`,
 	)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	promptResults, err := s.client.Query(
-		`sum by (namespace, container, model_name) (rate(vllm:prompt_tokens_total[5m]))`,
+		`sum by (namespace, model_name) (rate(vllm:prompt_tokens_total{namespace="default"}[5m]))`,
 	)
 	if err != nil {
 		return nil, nil, nil, err
@@ -501,14 +451,14 @@ func (s *Scraper) queryTokens() (genTokens, promptTokens map[string]float64, nam
 	promptTokens = make(map[string]float64)
 	names = make(map[string]string)
 	for _, r := range genResults {
-		key := r.Metric["namespace"] + "/" + r.Metric["container"]
+		key := r.Metric["namespace"]
 		genTokens[key] += r.Value
 		if names[key] == "" {
 			names[key] = r.Metric["model_name"]
 		}
 	}
 	for _, r := range promptResults {
-		key := r.Metric["namespace"] + "/" + r.Metric["container"]
+		key := r.Metric["namespace"]
 		promptTokens[key] += r.Value
 		if names[key] == "" {
 			names[key] = r.Metric["model_name"]
@@ -522,57 +472,41 @@ type ClusterTimePoint struct {
 	Timestamp       int64   `json:"t"`
 	PowerWatts      float64 `json:"power_watts"`
 	CO2GramsPerHour float64 `json:"co2_grams_per_hour"`
-	CO2MgPerToken   float64 `json:"co2_mg_per_token,omitempty"` // 0 when no active generation
+	CO2MgPerToken   float64 `json:"co2_mg_per_token,omitempty"`
 }
 
-// ClusterTimeSeries queries Prometheus for historical power + token data, applies
-// per-model carbon intensities, and returns aggregated cluster totals per time step.
+// ClusterTimeSeries queries Prometheus for historical power + token data and
+// returns aggregated totals per time step, using the fixed Berkeley intensity.
 func (s *Scraper) ClusterTimeSeries(rangeBack, step time.Duration) ([]ClusterTimePoint, error) {
 	end := time.Now()
 	start := end.Add(-rangeBack)
 
-	// Fetch power and token rate time series in parallel.
 	powerSeries, err := s.client.RangeQuery(
-		`sum by (namespace, container) (DCGM_FI_DEV_POWER_USAGE{namespace=~"nrp-llm|sdsc-llm"})`,
+		`sum by (namespace) (DCGM_FI_DEV_POWER_USAGE{namespace="default"})`,
 		start, end, step,
 	)
 	if err != nil {
 		return nil, err
 	}
-	// Use total tokens (prompt + generation) as denominator for CO₂/token.
-	// Agentic workloads have large prompt token counts that dominate compute.
 	tokenSeries, err := s.client.RangeQuery(
-		`sum by (namespace, container) (rate(vllm:generation_tokens_total[5m]) + rate(vllm:prompt_tokens_total[5m]))`,
+		`sum by (namespace) (rate(vllm:generation_tokens_total{namespace="default"}[5m]) + rate(vllm:prompt_tokens_total{namespace="default"}[5m]))`,
 		start, end, step,
 	)
 	if err != nil {
 		return nil, err
 	}
-
-	// Build intensity lookup from current model state.
-	s.mu.RLock()
-	intensityByKey := make(map[string]float64, len(s.models))
-	for key, m := range s.models {
-		intensityByKey[key] = m.CarbonIntensity
-	}
-	s.mu.RUnlock()
 
 	type agg struct{ power, co2, tokens float64 }
 	byTime := make(map[int64]*agg)
 
 	for _, sr := range powerSeries {
-		key := sr.Metric["namespace"] + "/" + sr.Metric["container"]
-		intensity, ok := intensityByKey[key]
-		if !ok {
-			intensity = carbon.USAverage
-		}
 		for _, pt := range sr.Points {
 			ts := pt.Time.Unix()
 			if byTime[ts] == nil {
 				byTime[ts] = &agg{}
 			}
 			byTime[ts].power += pt.Value
-			byTime[ts].co2 += carbon.GramsPerHour(pt.Value, intensity)
+			byTime[ts].co2 += carbon.GramsPerHour(pt.Value, carbon.BerkeleyIntensity)
 		}
 	}
 	for _, sr := range tokenSeries {
@@ -585,7 +519,6 @@ func (s *Scraper) ClusterTimeSeries(rangeBack, step time.Duration) ([]ClusterTim
 		}
 	}
 
-	// Sort by timestamp and return.
 	out := make([]ClusterTimePoint, 0, len(byTime))
 	for ts, a := range byTime {
 		pt := ClusterTimePoint{
@@ -593,26 +526,15 @@ func (s *Scraper) ClusterTimeSeries(rangeBack, step time.Duration) ([]ClusterTim
 			PowerWatts:      math.Round(a.power*10) / 10,
 			CO2GramsPerHour: math.Round(a.co2*10) / 10,
 		}
-		// CO2/token = total_co2_grams_per_hour / (tokens_per_sec × 3600) × 1000 mg/g
 		if a.tokens > 0.1 {
 			pt.CO2MgPerToken = math.Round(a.co2/a.tokens/3.6*1000) / 1000
 		}
 		out = append(out, pt)
 	}
-	// Simple insertion sort — range queries are usually small.
 	for i := 1; i < len(out); i++ {
 		for j := i; j > 0 && out[j].Timestamp < out[j-1].Timestamp; j-- {
 			out[j], out[j-1] = out[j-1], out[j]
 		}
 	}
 	return out, nil
-}
-
-func splitKey(key string) (namespace, container string) {
-	for i, c := range key {
-		if c == '/' {
-			return key[:i], key[i+1:]
-		}
-	}
-	return key, ""
 }
