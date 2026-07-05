@@ -355,7 +355,6 @@ sum by (namespace, container) (
   <li>CPU, DRAM, and network power are excluded (typically adds 15–30% to total)</li>
   <li>Datacenter PUE (Power Usage Effectiveness) is not applied (adds 10–50%)</li>
   <li>Carbon intensity values are annual averages; real-time grid mix varies hour-to-hour</li>
-  <li>Nodes not matching hostname or namespace patterns fall back to the California (CAMX) average</li>
   <li>DCGM reports a single power reading per GPU; we cannot decompose energy into prefill vs
     decode phases on the nimbus side</li>
   <li>The commercial frontier model spec is an informed estimate, not a known architecture.
