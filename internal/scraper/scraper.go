@@ -380,38 +380,72 @@ func (s *Scraper) scrape() {
 		h := s.history[key]
 		h.append(now, m)
 
-		var wSum24, tSum24, wSum7d, tSum7d float64
-		var powSum24, promptSum24, genSum24 float64
-		var nSum24 int
-		cutoff24h := now.Add(-24 * time.Hour).Truncate(time.Hour).Unix()
-		cutoff7d := now.Add(-7 * 24 * time.Hour).Truncate(time.Hour).Unix()
-		for _, b := range h.AvgBuckets {
-			if b.Hour >= cutoff7d {
-				wSum7d += b.WeightedSum
-				tSum7d += b.TokenSum
-			}
-			if b.Hour >= cutoff24h {
-				wSum24 += b.WeightedSum
-				tSum24 += b.TokenSum
-				powSum24 += b.PowerSum
-				promptSum24 += b.PromptTokSum
-				genSum24 += b.GenTokSum
-				nSum24++
-			}
+		co2Avg24h, co2Avg7d, powerAvg24h, promptAvg24h, genAvg24h := average24h7d(now, h.AvgBuckets)
+		if co2Avg24h != 0 {
+			m.CO2MgPerTokenAvg24h = co2Avg24h
 		}
-		if tSum24 > 0 {
-			m.CO2MgPerTokenAvg24h = math.Round(wSum24/tSum24*1000) / 1000
+		if co2Avg7d != 0 {
+			m.CO2MgPerTokenAvg7d = co2Avg7d
 		}
-		if tSum7d > 0 {
-			m.CO2MgPerTokenAvg7d = math.Round(wSum7d/tSum7d*1000) / 1000
-		}
-		if nSum24 > 0 {
-			n := float64(nSum24)
-			m.PowerWattsAvg24h = math.Round(powSum24/n*10) / 10
-			m.PromptTokensPerSecAvg24h = math.Round(promptSum24/n*10) / 10
-			m.GenerationTokensPerSecAvg24h = math.Round(genSum24/n*10) / 10
+		if powerAvg24h != 0 {
+			// powerAvg24h is 0 only when no samples fell in the 24h window
+			// (addSample never records a sample with power <= 0), so this
+			// single check gates all three time-weighted means together.
+			m.PowerWattsAvg24h = powerAvg24h
+			m.PromptTokensPerSecAvg24h = promptAvg24h
+			m.GenerationTokensPerSecAvg24h = genAvg24h
 		}
 	}
+}
+
+// average24h7d computes the 24h/7d token-weighted CO₂/token means (from
+// active samples only) and the 24h time-weighted power/prompt/gen-token
+// means (from every reporting sample), given the current time and a
+// model's accumulated hourly buckets.
+//
+// avgBucket.PowerSum/PromptTokSum/GenTokSum are sums over every individual
+// sample within that hour (accumulated by addSample), so the 24h means must
+// divide by the total number of samples across the touched buckets
+// (SampleCount), not by the number of buckets touched -- otherwise the
+// result scales with samples-per-hour instead of being a true per-sample
+// mean.
+//
+// Each return value is 0 when it could not be computed (no data in the
+// relevant window), matching how the corresponding ModelMetrics fields are
+// already zero-valued with `omitempty` JSON tags when not computed.
+func average24h7d(now time.Time, buckets []avgBucket) (co2Avg24h, co2Avg7d, powerAvg24h, promptAvg24h, genAvg24h float64) {
+	var wSum24, tSum24, wSum7d, tSum7d float64
+	var powSum24, promptSum24, genSum24 float64
+	var sampleSum24 int
+	cutoff24h := now.Add(-24 * time.Hour).Truncate(time.Hour).Unix()
+	cutoff7d := now.Add(-7 * 24 * time.Hour).Truncate(time.Hour).Unix()
+	for _, b := range buckets {
+		if b.Hour >= cutoff7d {
+			wSum7d += b.WeightedSum
+			tSum7d += b.TokenSum
+		}
+		if b.Hour >= cutoff24h {
+			wSum24 += b.WeightedSum
+			tSum24 += b.TokenSum
+			powSum24 += b.PowerSum
+			promptSum24 += b.PromptTokSum
+			genSum24 += b.GenTokSum
+			sampleSum24 += b.SampleCount
+		}
+	}
+	if tSum24 > 0 {
+		co2Avg24h = math.Round(wSum24/tSum24*1000) / 1000
+	}
+	if tSum7d > 0 {
+		co2Avg7d = math.Round(wSum7d/tSum7d*1000) / 1000
+	}
+	if sampleSum24 > 0 {
+		n := float64(sampleSum24)
+		powerAvg24h = math.Round(powSum24/n*10) / 10
+		promptAvg24h = math.Round(promptSum24/n*10) / 10
+		genAvg24h = math.Round(genSum24/n*10) / 10
+	}
+	return
 }
 
 // queryPower returns total GPU power (W) keyed by namespace.
