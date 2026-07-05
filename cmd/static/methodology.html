@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Methodology — NRP Carbon Dashboard</title>
+<title>Methodology — nimbus Carbon Dashboard</title>
 <style>
   :root { --bg:#0f1117; --surface:#1a1d27; --border:#2a2d3a; --text:#e2e8f0; --muted:#64748b; --accent:#6366f1; --green:#22c55e; }
   * { box-sizing:border-box; margin:0; padding:0; }
@@ -34,16 +34,17 @@
 <body>
 <header>
   <a href="/">← Dashboard</a>
-  <h1>NRP <span>Carbon</span> — Methodology</h1>
+  <h1>nimbus <span>Carbon</span> — Methodology</h1>
 </header>
 <main>
 
 <h2>Overview</h2>
 <p>
   This dashboard estimates the carbon footprint of large language model (LLM) inference
-  running on the <a href="https://nrp.ai" target="_blank">National Research Platform (NRP) Nautilus</a> cluster.
+  running on <code>nimbus</code>, a single GB10 DGX Spark node
+  (<a href="https://github.com/boettiger-lab/k8s/tree/main/vllm/nimbus" target="_blank">boettiger-lab/k8s/vllm/nimbus</a>).
   All measurements are derived passively from existing telemetry — no instrumentation of
-  the LLM services is required.
+  the LLM service is required.
 </p>
 
 <div class="callout">
@@ -56,16 +57,17 @@
 <p>
   GPU power draw is read from
   <a href="https://github.com/NVIDIA/dcgm-exporter" target="_blank">NVIDIA DCGM Exporter</a>
-  (<em>Data Center GPU Manager</em>), which runs as a DaemonSet on every GPU node in the
-  NRP cluster. DCGM reads the hardware power sensor via NVML
-  (<code>nvmlDeviceGetPowerUsage</code>) and exports it to Prometheus as:
+  (<em>Data Center GPU Manager</em>), which runs on nimbus's single GPU (a GB10). DCGM
+  reads the hardware power sensor via NVML (<code>nvmlDeviceGetPowerUsage</code>) and
+  exports it to Prometheus as:
 </p>
-<pre><code>DCGM_FI_DEV_POWER_USAGE{namespace, container, Hostname, ...}  # watts, per GPU</code></pre>
+<pre><code>DCGM_FI_DEV_POWER_USAGE{namespace, container, pod, ...}  # watts, one GPU</code></pre>
 <p>
-  We aggregate all GPUs belonging to each LLM pod using a PromQL sum:
+  nimbus has exactly one physical GPU, so no summing across GPUs is needed — just a
+  namespace filter:
 </p>
-<pre><code>sum by (namespace, container, Hostname) (
-  avg_over_time(DCGM_FI_DEV_POWER_USAGE{namespace=~"nrp-llm|sdsc-llm"}[5m])
+<pre><code>sum by (namespace) (
+  avg_over_time(DCGM_FI_DEV_POWER_USAGE{namespace="default"}[5m])
 )</code></pre>
 <p>
   The <code>avg_over_time(...[5m])</code> wrapper smooths short-lived spikes into a 5-minute
@@ -155,29 +157,17 @@ sum by (namespace, container, model_name) (
   rather than starting from zero.
 </p>
 
-<h2>Step 3 — Carbon Intensity by Grid Location</h2>
+<h2>Step 3 — Carbon Intensity</h2>
 <p>
-  NRP nodes are hosted at universities and research institutions across the United States
-  and internationally. Grid carbon intensity varies substantially by location. We use
-  <a href="https://www.epa.gov/egrid" target="_blank">EPA eGRID 2022 subregion averages</a>
-  matched to each node's <code>Hostname</code> label. When the hostname doesn't match,
-  a secondary lookup by Kubernetes namespace prefix is attempted (e.g. <code>sdsc-llm</code>
-  maps to California). If neither matches, the fallback is the California CAMX intensity
-  (0.198 kg CO₂/kWh), since the majority of NRP Nautilus nodes are hosted at SDSC in
-  San Diego:
+  nimbus is one machine in one place: Berkeley, CA. Grid carbon intensity is therefore a
+  fixed constant rather than a lookup table — the
+  <a href="https://www.epa.gov/egrid" target="_blank">EPA eGRID 2022</a> average for the
+  CAMX subregion (California):
 </p>
 
 <table>
-  <tr><th>Institution / Region</th><th>Hostname pattern</th><th>eGRID Subregion</th><th>Intensity (kg CO₂/kWh)</th></tr>
-  <tr><td>California (SDSC, CSUS, Caltech, Humboldt, UCSD, UCLA, UCSB, CalIT2, CSUMB)</td><td><code>*.sdsc.*</code>, <code>*.csus.*</code>, <code>*.humboldt.*</code>, <code>*.caltech.*</code>, <code>*.ucsd.*</code>, <code>*.ucla.*</code>, <code>*.ucsb.*</code>, <code>*.calit2.*</code>, <code>csumb.*</code>, <code>nautilus-*</code>, <code>sdsc-*</code></td><td>CAMX</td><td>0.198</td></tr>
-  <tr><td>NYU (New York)</td><td><code>*.nyu.*</code></td><td>NYUP</td><td>0.174</td></tr>
-  <tr><td>UNL (Nebraska)</td><td><code>*.unl.*</code></td><td>MROW</td><td>0.531</td></tr>
-  <tr><td>UT Austin / TACC (Texas)</td><td><code>*.utexas.*</code>, <code>*.tacc.*</code></td><td>ERCO</td><td>0.393</td></tr>
-  <tr><td>Clemson (South Carolina)</td><td><code>*.clemson.*</code></td><td>SRSO</td><td>0.423</td></tr>
-  <tr><td>University of Hawaii</td><td><code>*.hawaii.*</code></td><td>HIOA</td><td>0.702</td></tr>
-  <tr><td>K-State (Kansas)</td><td><code>*.ksu.*</code></td><td>SPSO</td><td>0.555</td></tr>
-  <tr><td>KREONET (South Korea)</td><td><code>*.kreonet.*</code></td><td>Korean grid</td><td>0.459</td></tr>
-  <tr><td><em>All other nodes</em></td><td>—</td><td>CAMX (California default)</td><td>0.198</td></tr>
+  <tr><th>Location</th><th>eGRID Subregion</th><th>Intensity (kg CO₂/kWh)</th></tr>
+  <tr><td>Berkeley, CA</td><td>CAMX</td><td>0.198</td></tr>
 </table>
 
 <h2>Step 4 — Carbon Calculations</h2>
@@ -202,14 +192,14 @@ CO₂_mg/token = P_watts × intensity_kg/kWh × (1e6 mg/kg) / (3.6e6 J/kWh) / to
 <h3>Commercial frontier comparison — per-model physics estimate</h3>
 <p>
   Rather than comparing against a fixed hypothetical workload, the dashboard computes
-  a <strong>per-model, apples-to-apples power comparison</strong>: for each NRP model's
+  a <strong>per-model, apples-to-apples power comparison</strong>: for each nimbus model's
   actual observed token throughput (prompt and generation rates), what total power would
   a commercial frontier model draw to serve the same tokens at the same rate?
 </p>
 <div class="callout">
   <p><strong>Key principle:</strong> The comparison holds everything fixed except model
   size — same tokens, same traffic level, <strong>same grid</strong>. The frontier model's
-  CO₂/token is computed using the same grid carbon intensity as the NRP model it's compared
+  CO₂/token is computed using the same grid carbon intensity as the nimbus model it's compared
   against. This isolates the model size/energy tradeoff: a larger frontier model may produce
   higher-quality output, but requires substantially more hardware — and therefore more
   energy — to host and run. Because grid intensity is the same on both sides, the CO₂ ratio
@@ -247,7 +237,7 @@ CO₂_mg/token = P_watts × intensity_kg/kWh × (1e6 mg/kg) / (3.6e6 J/kWh) / to
 <table>
   <tr><th>Phase</th><th>Marginal energy</th><th>Derivation</th></tr>
   <tr><td>Prefill (input tokens)</td><td>0.5 J/token</td><td>Compute-bound: 600 GFLOPS/token, 24× H100 at 60% util → 23,700 tok/s; additional power (700−225)×24 = 11,400 W → 0.48 J/tok</td></tr>
-  <tr><td>Decode (output tokens)</td><td>6 J/token</td><td>Memory-bandwidth-bound at low batch (B≈1–4, matching NRP traffic): must load 300 GB active weights per step; 80.4 TB/s → 270 tok/s; ~3,000 W additional → ~11 J at B=1, ~4 J at B=4</td></tr>
+  <tr><td>Decode (output tokens)</td><td>6 J/token</td><td>Memory-bandwidth-bound at low batch (B≈1–4, matching nimbus traffic): must load 300 GB active weights per step; 80.4 TB/s → 270 tok/s; ~3,000 W additional → ~11 J at B=1, ~4 J at B=4</td></tr>
 </table>
 
 <h3>Per-model comparison formula</h3>
@@ -257,13 +247,13 @@ CO₂_mg/token = P_watts × intensity_kg/kWh × (1e6 mg/kg) / (3.6e6 J/kWh) / to
 
 ratio = frontier_watts / nrp_measured_watts</code></pre>
 <p>
-  This formula is applied to each NRP model using its <strong>actual observed</strong>
+  This formula is applied to each nimbus model using its <strong>actual observed</strong>
   prompt and generation token rates. The comparison is shown as a watts bar on each model
   card and as a CO₂/token bar chart (colored by energy ratio) across all models.
 </p>
 
 <h3>Example: Qwen3.5-397B at low traffic</h3>
-<pre><code>NRP measured:    783 W  (8× A100, real DCGM reading)
+<pre><code>nimbus measured: 783 W  (8× A100, real DCGM reading)
 Prompt rate:       3 tok/s
 Generation rate:  15 tok/s
 
@@ -273,17 +263,17 @@ Commercial frontier equivalent:
   Decode:        15 × 6.0 =    90 W
   Total:                    5,492 W
 
-Ratio: 5,492 / 783 = 7.0× — NRP uses 7× less energy for the same tokens.</code></pre>
+Ratio: 5,492 / 783 = 7.0× — nimbus uses 7× less energy for the same tokens.</code></pre>
 
 <div class="callout">
-  <p><strong>Why this is fair:</strong> Both sides include hosting costs. The NRP model
+  <p><strong>Why this is fair:</strong> Both sides include hosting costs. The nimbus model
   draws ~783 W to keep 8× A100 GPUs powered; the commercial frontier would draw ~5,400 W just to
   keep 24× H100 GPUs powered. At low traffic, both clusters are underutilized — the
   comparison reflects the real energy cost of maintaining each capability, not an idealized
   marginal-only estimate for one side.</p>
 </div>
 <div class="callout">
-  <p><strong>What this doesn't measure:</strong> NRP figures are GPU power only (no CPU,
+  <p><strong>What this doesn't measure:</strong> nimbus figures are GPU power only (no CPU,
   DRAM, PUE). Applying a typical 1.5–2× system-overhead correction to both sides would
   preserve the ratio. Commercial cloud PUE (~1.1–1.3) vs. research facility PUE may
   differ slightly but does not change the order-of-magnitude comparison.</p>
@@ -301,7 +291,7 @@ Ratio: 5,492 / 783 = 7.0× — NRP uses 7× less energy for the same tokens.</co
 </p>
 <ul style="color:#cbd5e1; padding-left:1.5rem; margin:0.5rem 0 1rem;">
   <li><strong>CO₂/token bar chart:</strong> Bars show the <strong>token-weighted</strong>
-  24-hour average CO₂ per token (mg) for each active NRP model. Each 30-second sample is
+  24-hour average CO₂ per token (mg) for each active nimbus model. Each 30-second sample is
   weighted by its throughput (tok/s), so periods of high utilization contribute
   proportionally more to the average than brief low-throughput transitions. This prevents
   ramp-up/ramp-down periods (where CO₂/token is transiently extreme due to idle power
@@ -313,7 +303,7 @@ Ratio: 5,492 / 783 = 7.0× — NRP uses 7× less energy for the same tokens.</co
   <li><strong>Model card "N× less energy" metric:</strong> Each model card shows how many
   times more power the commercial frontier would require to serve the same tokens
   (e.g. "7.0× less energy"). This is <code>frontier_watts / nrp_measured_watts</code>.</li>
-  <li><strong>Power comparison bar (per card):</strong> A horizontal bar comparing NRP
+  <li><strong>Power comparison bar (per card):</strong> A horizontal bar comparing nimbus
   measured watts (green) against the frontier equivalent (purple band), with a breakdown
   of idle floor vs. marginal power.</li>
 </ul>
@@ -343,7 +333,7 @@ Ratio: 5,492 / 783 = 7.0× — NRP uses 7× less energy for the same tokens.</co
   <p><strong>Note:</strong> J/token only appears for models with &gt;5 tok/s total throughput.
   Below this threshold the metric is dominated by idle power and not meaningful as an
   efficiency measure. Bar color ranges from green (most efficient) to red (least efficient)
-  relative to the other active NRP models. Tooltips show the underlying watts, tok/s, and
+  relative to the other active nimbus models. Tooltips show the underlying watts, tok/s, and
   GPU hardware for context.</p>
 </div>
 
@@ -367,13 +357,13 @@ sum by (namespace, container) (
   <li>Carbon intensity values are annual averages; real-time grid mix varies hour-to-hour</li>
   <li>Nodes not matching hostname or namespace patterns fall back to the California (CAMX) average</li>
   <li>DCGM reports a single power reading per GPU; we cannot decompose energy into prefill vs
-    decode phases on the NRP side</li>
+    decode phases on the nimbus side</li>
   <li>The commercial frontier model spec is an informed estimate, not a known architecture.
     No empirical per-token energy measurement exists for GPT-4, Claude 3/3.5/3.7, or Gemini 1.5/2.
     The closest empirical anchor is Google's production measurement of 0.24 Wh/prompt for Gemini
     Apps (arXiv:2508.15734). Our physics-based estimate is broadly consistent with this and with
     independent bottom-up estimates (0.34 Wh median, arXiv:2509.20241)</li>
-  <li>Decode marginal energy (6 J/token) assumes low batch matching typical NRP traffic;
+  <li>Decode marginal energy (6 J/token) assumes low batch matching typical nimbus traffic;
     commercial providers batching hundreds of concurrent requests achieve lower per-token
     decode costs, but also require the same or greater hosting floor</li>
   <li>Agentic energy amplification is highly framework-dependent: measured research-grade
@@ -468,14 +458,16 @@ sum by (namespace, container) (
 <h2>Source Code</h2>
 <p>
   This dashboard is open source:
-  <a href="https://github.com/boettiger-lab/nrp-carbon-api" target="_blank">github.com/boettiger-lab/nrp-carbon-api</a>.
-  The carbon intensity lookup table is in
+  <a href="https://github.com/boettiger-lab/nimbus-carbon-api" target="_blank">github.com/boettiger-lab/nimbus-carbon-api</a>,
+  forked from
+  <a href="https://github.com/boettiger-lab/nrp-carbon-api" target="_blank">nrp-carbon-api</a>.
+  The fixed carbon intensity constant is in
   <code>internal/carbon/intensity.go</code>.
 </p>
 
 </main>
 <footer>
-  NRP Carbon Dashboard · <a href="/">Back to Dashboard</a>
+  nimbus Carbon Dashboard · <a href="/">Back to Dashboard</a>
 </footer>
 </body>
 </html>
