@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nimbus-carbon-api
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nimbus-carbon-api
+  template:
+    metadata:
+      labels:
+        app: nimbus-carbon-api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: nimbus-carbon-api
+          image: ghcr.io/boettiger-lab/nimbus-carbon-api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PROMETHEUS_URL
+              value: "http://prometheus-server.monitoring.svc.cluster.local"
+            - name: SCRAPE_INTERVAL
+              value: "30s"
+            - name: LISTEN_ADDR
+              value: ":8080"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nimbus-carbon-api
+  namespace: default
+spec:
+  selector:
+    app: nimbus-carbon-api
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nimbus-carbon-api
+  namespace: default
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-production
+    external-dns.alpha.kubernetes.io/cloudflare-proxied: "false"
+  labels:
+    app: nimbus-carbon-api
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: carbon-nimbus.carlboettiger.info
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nimbus-carbon-api
+            port:
+              number: 80
+  tls:
+  - hosts:
+    - carbon-nimbus.carlboettiger.info
+    secretName: nimbus-carbon-api-tls
