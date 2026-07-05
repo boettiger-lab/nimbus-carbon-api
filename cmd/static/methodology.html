@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Methodology — NRP Carbon Dashboard</title>
+<style>
+  :root { --bg:#0f1117; --surface:#1a1d27; --border:#2a2d3a; --text:#e2e8f0; --muted:#64748b; --accent:#6366f1; --green:#22c55e; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font-family:system-ui,sans-serif; line-height:1.7; }
+  header { padding:1.25rem 2rem; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:1rem; }
+  header a { color:var(--muted); text-decoration:none; font-size:0.85rem; }
+  header a:hover { color:var(--text); }
+  header h1 { font-size:1.1rem; font-weight:600; }
+  header h1 span { color:var(--accent); }
+  main { max-width:860px; margin:0 auto; padding:2.5rem 2rem; }
+  h2 { font-size:1.2rem; font-weight:600; margin:2rem 0 0.75rem; color:var(--text); }
+  h2:first-child { margin-top:0; }
+  h3 { font-size:0.95rem; font-weight:600; margin:1.5rem 0 0.5rem; color:var(--text); }
+  p { color:#cbd5e1; margin-bottom:0.75rem; }
+  a { color:var(--accent); }
+  code { background:var(--surface); border:1px solid var(--border); border-radius:4px; padding:0.1em 0.4em; font-size:0.875em; font-family:monospace; }
+  pre { background:var(--surface); border:1px solid var(--border); border-radius:0.5rem; padding:1rem 1.25rem; overflow-x:auto; margin:1rem 0; }
+  pre code { background:none; border:none; padding:0; font-size:0.85rem; }
+  table { width:100%; border-collapse:collapse; margin:1rem 0; font-size:0.875rem; }
+  th { text-align:left; padding:0.5rem 0.75rem; border-bottom:1px solid var(--border); color:var(--muted); font-weight:600; font-size:0.75rem; text-transform:uppercase; letter-spacing:0.05em; }
+  td { padding:0.5rem 0.75rem; border-bottom:1px solid rgba(255,255,255,0.04); color:#cbd5e1; }
+  tr:last-child td { border-bottom:none; }
+  .callout { background:var(--surface); border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:0.5rem; padding:1rem 1.25rem; margin:1rem 0; }
+  .callout p:last-child { margin-bottom:0; }
+  footer { text-align:center; padding:2rem; font-size:0.75rem; color:var(--muted); border-top:1px solid var(--border); margin-top:3rem; }
+</style>
+</head>
+<body>
+<header>
+  <a href="/">← Dashboard</a>
+  <h1>NRP <span>Carbon</span> — Methodology</h1>
+</header>
+<main>
+
+<h2>Overview</h2>
+<p>
+  This dashboard estimates the carbon footprint of large language model (LLM) inference
+  running on the <a href="https://nrp.ai" target="_blank">National Research Platform (NRP) Nautilus</a> cluster.
+  All measurements are derived passively from existing telemetry — no instrumentation of
+  the LLM services is required.
+</p>
+
+<div class="callout">
+  <p><strong>Key principle:</strong> Carbon = Energy × Grid Intensity. We measure GPU energy
+  directly from hardware sensors already reporting to the cluster's Prometheus instance,
+  then multiply by published grid carbon intensity for each node's location.</p>
+</div>
+
+<h2>Step 1 — Measuring GPU Power</h2>
+<p>
+  GPU power draw is read from
+  <a href="https://github.com/NVIDIA/dcgm-exporter" target="_blank">NVIDIA DCGM Exporter</a>
+  (<em>Data Center GPU Manager</em>), which runs as a DaemonSet on every GPU node in the
+  NRP cluster. DCGM reads the hardware power sensor via NVML
+  (<code>nvmlDeviceGetPowerUsage</code>) and exports it to Prometheus as:
+</p>
+<pre><code>DCGM_FI_DEV_POWER_USAGE{namespace, container, Hostname, ...}  # watts, per GPU</code></pre>
+<p>
+  We aggregate all GPUs belonging to each LLM pod using a PromQL sum:
+</p>
+<pre><code>sum by (namespace, container, Hostname) (
+  avg_over_time(DCGM_FI_DEV_POWER_USAGE{namespace=~"nrp-llm|sdsc-llm"}[5m])
+)</code></pre>
+<p>
+  The <code>avg_over_time(...[5m])</code> wrapper smooths short-lived spikes into a 5-minute
+  rolling average. This gives total GPU power in <strong>watts</strong> for each deployed model.
+  Measurements are scraped every 30 seconds.
+</p>
+<div class="callout">
+  <p><strong>Limitation:</strong> We measure <em>GPU power only</em>. CPU, RAM, storage, and
+  networking power are not included. For GPU-heavy inference workloads this typically
+  represents 70–85% of total server power. A full datacenter PUE factor (usually 1.1–1.5)
+  is also not applied. Our figures are therefore conservative underestimates of total
+  facility energy.</p>
+</div>
+
+<h2>Step 2 — Token Throughput (Prompt + Generation)</h2>
+<p>
+  Token throughput is read from vLLM's built-in Prometheus metrics. Two counters are
+  tracked separately and summed into a total token rate:
+</p>
+<pre><code>-- Output (decode) tokens generated per second:
+sum by (namespace, container, model_name) (
+  rate(vllm:generation_tokens_total[5m])
+)
+
+-- Input (prefill) tokens processed per second:
+sum by (namespace, container, model_name) (
+  rate(vllm:prompt_tokens_total[5m])
+)</code></pre>
+<p>
+  Both phases consume GPU energy: the <strong>prefill</strong> phase runs attention over
+  every input token before the first output token is produced; the <strong>decode</strong>
+  phase generates one output token at a time. Counting only output tokens would therefore
+  misrepresent the true cost of inference — especially for agentic workloads where a single
+  user-visible response may involve tens of thousands of input tokens across multiple hidden
+  tool calls.
+</p>
+<div class="callout">
+  <p><strong>Why this matters for agentic AI:</strong> In agentic workloads, a single
+  user-visible response may involve tens of thousands of input tokens across multiple
+  hidden tool calls. Empirical studies confirm this dramatically. A 2025 measurement study
+  (<a href="https://arxiv.org/abs/2506.04301" target="_blank">arXiv:2506.04301</a>) found
+  that agentic reasoning frameworks (Reflexion, LATS) consume <strong>62–137× more energy</strong>
+  per task than single-turn queries. A tokenomics study of multi-agent software engineering
+  (<a href="https://arxiv.org/abs/2601.14470" target="_blank">arXiv:2601.14470</a>) found
+  that 53.9% of all tokens processed are input (prefill) tokens, with an
+  input-to-output ratio of roughly 2:1. Real-world API data (OpenRouter, 2025) shows that
+  programming prompts — the dominant agentic use case — routinely exceed 20,000 input tokens
+  and grew ~4× in average length from early 2024 to late 2025.</p>
+  <p>If CO₂/token were computed over output tokens only, it would overstate the per-token cost
+  by 10–20×. The dashboard uses <em>total tokens</em> (input + output) as the denominator, so
+  reported CO₂/token reflects the full energy cost amortized across every token the GPU
+  processed.</p>
+</div>
+<p>
+  The <strong>CO₂ per token</strong> metric is only reported when total throughput (input +
+  output) is at least 5 tok/s. Below this threshold the ratio is dominated by near-idle
+  power draw rather than the model's efficiency under real load. The dashboard cards break
+  down throughput into <em>Output tok/s</em>, <em>Input tok/s</em>, and <em>Total tok/s</em>
+  for transparency.
+</p>
+
+<h3>Token-weighted averaging</h3>
+<p>
+  The 24-hour and 7-day CO₂/token averages shown in the bar chart use a
+  <strong>token-weighted mean</strong> rather than an unweighted arithmetic mean.
+  Because CO₂/token is a ratio (power ÷ throughput), samples taken during low-throughput
+  periods produce extreme values — a model drawing 2,000 W at 5 tok/s yields
+  110 mg/token, versus 0.03 mg at 3,000 tok/s. An unweighted mean gives equal
+  influence to both, inflating the average by orders of magnitude.
+</p>
+<p>
+  The weighted formula:
+</p>
+<pre><code>avg_CO₂/token = Σ(CO₂_per_token_i × tokens_per_sec_i) / Σ(tokens_per_sec_i)</code></pre>
+<p>
+  This is equivalent to computing total CO₂ emitted divided by total tokens produced,
+  which is the physically meaningful quantity. A 30-second sample at 5 tok/s
+  (representing ~150 tokens) contributes proportionally less than a sample at 3,000 tok/s
+  (representing ~90,000 tokens). Models under sustained heavy load naturally converge to
+  their true operating efficiency.
+</p>
+<p>
+  Internally, samples are aggregated into <strong>hourly buckets</strong> (168 buckets
+  for 7 days), each storing the weighted sum and token sum for that hour. On startup,
+  the scraper backfills these buckets from 7 days of historical Prometheus data, so
+  the 24-hour and 7-day averages are immediately correct after a service restart
+  rather than starting from zero.
+</p>
+
+<h2>Step 3 — Carbon Intensity by Grid Location</h2>
+<p>
+  NRP nodes are hosted at universities and research institutions across the United States
+  and internationally. Grid carbon intensity varies substantially by location. We use
+  <a href="https://www.epa.gov/egrid" target="_blank">EPA eGRID 2022 subregion averages</a>
+  matched to each node's <code>Hostname</code> label. When the hostname doesn't match,
+  a secondary lookup by Kubernetes namespace prefix is attempted (e.g. <code>sdsc-llm</code>
+  maps to California). If neither matches, the fallback is the California CAMX intensity
+  (0.198 kg CO₂/kWh), since the majority of NRP Nautilus nodes are hosted at SDSC in
+  San Diego:
+</p>
+
+<table>
+  <tr><th>Institution / Region</th><th>Hostname pattern</th><th>eGRID Subregion</th><th>Intensity (kg CO₂/kWh)</th></tr>
+  <tr><td>California (SDSC, CSUS, Caltech, Humboldt, UCSD, UCLA, UCSB, CalIT2, CSUMB)</td><td><code>*.sdsc.*</code>, <code>*.csus.*</code>, <code>*.humboldt.*</code>, <code>*.caltech.*</code>, <code>*.ucsd.*</code>, <code>*.ucla.*</code>, <code>*.ucsb.*</code>, <code>*.calit2.*</code>, <code>csumb.*</code>, <code>nautilus-*</code>, <code>sdsc-*</code></td><td>CAMX</td><td>0.198</td></tr>
+  <tr><td>NYU (New York)</td><td><code>*.nyu.*</code></td><td>NYUP</td><td>0.174</td></tr>
+  <tr><td>UNL (Nebraska)</td><td><code>*.unl.*</code></td><td>MROW</td><td>0.531</td></tr>
+  <tr><td>UT Austin / TACC (Texas)</td><td><code>*.utexas.*</code>, <code>*.tacc.*</code></td><td>ERCO</td><td>0.393</td></tr>
+  <tr><td>Clemson (South Carolina)</td><td><code>*.clemson.*</code></td><td>SRSO</td><td>0.423</td></tr>
+  <tr><td>University of Hawaii</td><td><code>*.hawaii.*</code></td><td>HIOA</td><td>0.702</td></tr>
+  <tr><td>K-State (Kansas)</td><td><code>*.ksu.*</code></td><td>SPSO</td><td>0.555</td></tr>
+  <tr><td>KREONET (South Korea)</td><td><code>*.kreonet.*</code></td><td>Korean grid</td><td>0.459</td></tr>
+  <tr><td><em>All other nodes</em></td><td>—</td><td>CAMX (California default)</td><td>0.198</td></tr>
+</table>
+
+<h2>Step 4 — Carbon Calculations</h2>
+<p>Three derived metrics are computed:</p>
+
+<h3>CO₂ grams per hour</h3>
+<pre><code>CO₂_g/hr = P_watts × intensity_kg/kWh
+         = P_watts × intensity   # because W × kg/kWh = W × kg/(1000W·h) × 1000 = g/h</code></pre>
+
+<h3>CO₂ milligrams per token (total tokens)</h3>
+<pre><code>total_tokens_per_sec = prompt_tokens_per_sec + generation_tokens_per_sec
+
+CO₂_mg/token = P_watts × intensity_kg/kWh × (1e6 mg/kg) / (3.6e6 J/kWh) / total_tokens_per_sec
+             = P_watts × intensity × 0.2778 / total_tokens_per_sec</code></pre>
+<p>
+  The denominator is <strong>total tokens processed</strong> (prompt + generation), not
+  output tokens alone. This is the correct normalization: the GPU expends energy on every
+  token it touches — both the input context during prefill and each generated token during
+  decode.
+</p>
+
+<h3>Commercial frontier comparison — per-model physics estimate</h3>
+<p>
+  Rather than comparing against a fixed hypothetical workload, the dashboard computes
+  a <strong>per-model, apples-to-apples power comparison</strong>: for each NRP model's
+  actual observed token throughput (prompt and generation rates), what total power would
+  a commercial frontier model draw to serve the same tokens at the same rate?
+</p>
+<div class="callout">
+  <p><strong>Key principle:</strong> The comparison holds everything fixed except model
+  size — same tokens, same traffic level, <strong>same grid</strong>. The frontier model's
+  CO₂/token is computed using the same grid carbon intensity as the NRP model it's compared
+  against. This isolates the model size/energy tradeoff: a larger frontier model may produce
+  higher-quality output, but requires substantially more hardware — and therefore more
+  energy — to host and run. Because grid intensity is the same on both sides, the CO₂ ratio
+  equals the watts ratio.</p>
+</div>
+
+<h3>Commercial frontier model specification</h3>
+<p>
+  We model a commercial frontier LLM as a ~1.5 T parameter Mixture-of-Experts (MoE) with
+  ~300 B active parameters per token, served in FP8 on H100-80GB GPUs. This is an
+  informed estimate, not a known architecture — commercial providers (OpenAI, Anthropic,
+  Google) do not publicly disclose hardware configurations or per-query power measurements.
+  The closest available ground truth is Google's measured production figure of
+  <strong>0.24 Wh per median Gemini prompt</strong>
+  (<a href="https://arxiv.org/abs/2508.15734" target="_blank">arXiv:2508.15734</a>, August 2025),
+  covering accelerators, CPU, DRAM, and datacenter overhead. An independent bottom-up analysis
+  estimates a median of <strong>0.34 Wh per query</strong> (IQR: 0.18–0.67 Wh) for models
+  exceeding 200 B parameters on H100 hardware
+  (<a href="https://arxiv.org/abs/2509.20241" target="_blank">arXiv:2509.20241</a>).
+  Our physics-based idle floor of ~5,400 W for 24× H100 GPUs is consistent with these
+  per-query figures at realistic throughput: at 50 tok/s total and 0.34 Wh/query (~700 tokens),
+  the implied power draw is ~87 W above the idle floor, broadly consistent with our
+  marginal energy estimates below.
+</p>
+<table>
+  <tr><th>Parameter</th><th>Value</th><th>Derivation</th></tr>
+  <tr><td>Total parameters</td><td>~1.5 T</td><td>Frontier MoE estimate (2026)</td></tr>
+  <tr><td>Active parameters/token</td><td>~300 B</td><td>Typical MoE activation ratio</td></tr>
+  <tr><td>Weight memory (FP8)</td><td>~1.5 TB</td><td>1 byte/param × 1.5 T params</td></tr>
+  <tr><td>Minimum GPUs</td><td>24× H100-80GB</td><td>1.92 TB total HBM for weights + KV cache + activations</td></tr>
+  <tr><td>Idle power</td><td>225 W/GPU × 24 = <strong>5,400 W</strong></td><td>H100 SXM measured idle</td></tr>
+</table>
+
+<h3>Marginal token energy (above idle)</h3>
+<table>
+  <tr><th>Phase</th><th>Marginal energy</th><th>Derivation</th></tr>
+  <tr><td>Prefill (input tokens)</td><td>0.5 J/token</td><td>Compute-bound: 600 GFLOPS/token, 24× H100 at 60% util → 23,700 tok/s; additional power (700−225)×24 = 11,400 W → 0.48 J/tok</td></tr>
+  <tr><td>Decode (output tokens)</td><td>6 J/token</td><td>Memory-bandwidth-bound at low batch (B≈1–4, matching NRP traffic): must load 300 GB active weights per step; 80.4 TB/s → 270 tok/s; ~3,000 W additional → ~11 J at B=1, ~4 J at B=4</td></tr>
+</table>
+
+<h3>Per-model comparison formula</h3>
+<pre><code>frontier_watts = 24 × 225                                   # idle floor: 5,400 W
+               + prompt_tokens_per_sec × 0.5                 # marginal prefill
+               + generation_tokens_per_sec × 6.0             # marginal decode
+
+ratio = frontier_watts / nrp_measured_watts</code></pre>
+<p>
+  This formula is applied to each NRP model using its <strong>actual observed</strong>
+  prompt and generation token rates. The comparison is shown as a watts bar on each model
+  card and as a CO₂/token bar chart (colored by energy ratio) across all models.
+</p>
+
+<h3>Example: Qwen3.5-397B at low traffic</h3>
+<pre><code>NRP measured:    783 W  (8× A100, real DCGM reading)
+Prompt rate:       3 tok/s
+Generation rate:  15 tok/s
+
+Commercial frontier equivalent:
+  Idle floor:    24 × 225 = 5,400 W
+  Prefill:        3 × 0.5 =     2 W
+  Decode:        15 × 6.0 =    90 W
+  Total:                    5,492 W
+
+Ratio: 5,492 / 783 = 7.0× — NRP uses 7× less energy for the same tokens.</code></pre>
+
+<div class="callout">
+  <p><strong>Why this is fair:</strong> Both sides include hosting costs. The NRP model
+  draws ~783 W to keep 8× A100 GPUs powered; the commercial frontier would draw ~5,400 W just to
+  keep 24× H100 GPUs powered. At low traffic, both clusters are underutilized — the
+  comparison reflects the real energy cost of maintaining each capability, not an idealized
+  marginal-only estimate for one side.</p>
+</div>
+<div class="callout">
+  <p><strong>What this doesn't measure:</strong> NRP figures are GPU power only (no CPU,
+  DRAM, PUE). Applying a typical 1.5–2× system-overhead correction to both sides would
+  preserve the ratio. Commercial cloud PUE (~1.1–1.3) vs. research facility PUE may
+  differ slightly but does not change the order-of-magnitude comparison.</p>
+</div>
+
+<p>
+  Each card also displays the <strong>observed prompt token percentage</strong> — what
+  fraction of total tokens are input (prefill) vs output (decode), for transparency
+  about the workload driving the comparison.
+</p>
+
+<h3>Dashboard visualizations</h3>
+<p>
+  The dashboard presents the frontier comparison in two ways:
+</p>
+<ul style="color:#cbd5e1; padding-left:1.5rem; margin:0.5rem 0 1rem;">
+  <li><strong>CO₂/token bar chart:</strong> Bars show the <strong>token-weighted</strong>
+  24-hour average CO₂ per token (mg) for each active NRP model. Each 30-second sample is
+  weighted by its throughput (tok/s), so periods of high utilization contribute
+  proportionally more to the average than brief low-throughput transitions. This prevents
+  ramp-up/ramp-down periods (where CO₂/token is transiently extreme due to idle power
+  divided by few tokens) from dominating the long-run average. Green diamond (◆) markers
+  show the current 5-minute rate.
+  Bar color ranges from <span style="color:#22c55e">green</span> (low carbon per token) to
+  <span style="color:#ef4444">red</span> (high) — reflecting both energy efficiency and
+  grid carbon intensity at the model's location.</li>
+  <li><strong>Model card "N× less energy" metric:</strong> Each model card shows how many
+  times more power the commercial frontier would require to serve the same tokens
+  (e.g. "7.0× less energy"). This is <code>frontier_watts / nrp_measured_watts</code>.</li>
+  <li><strong>Power comparison bar (per card):</strong> A horizontal bar comparing NRP
+  measured watts (green) against the frontier equivalent (purple band), with a breakdown
+  of idle floor vs. marginal power.</li>
+</ul>
+
+<h3>Energy efficiency across models (J/token view)</h3>
+<p>
+  The bar chart can be toggled to show <strong>J/token</strong> (joules per token) —
+  a hardware- and grid-neutral measure of how efficiently each model converts GPU power
+  into tokens:
+</p>
+<pre><code>J_per_token = power_watts / total_tokens_per_sec</code></pre>
+<p>
+  Unlike CO₂/token, this metric is independent of grid carbon intensity, making it
+  directly comparable across models regardless of where they are hosted. A model
+  with high J/token is underutilized relative to its GPU allocation — the GPUs draw
+  near-idle power while producing few tokens. Key drivers of high J/token include:
+</p>
+<ul style="color:#cbd5e1; padding-left:1.5rem; margin:0.5rem 0 1rem;">
+  <li><strong>Low traffic:</strong> GPU idle power dominates when few tokens are being processed</li>
+  <li><strong>Oversized allocation:</strong> More GPUs than needed for the model's actual demand</li>
+  <li><strong>Model architecture:</strong> Dense models activate all parameters on every token,
+  while Mixture-of-Experts (MoE) models route each token through a subset (~20%) of total
+  weights. A dense 31B model may therefore have higher J/token than a 397B MoE, because the
+  MoE only activates ~60B parameters per token</li>
+</ul>
+<div class="callout">
+  <p><strong>Note:</strong> J/token only appears for models with &gt;5 tok/s total throughput.
+  Below this threshold the metric is dominated by idle power and not meaningful as an
+  efficiency measure. Bar color ranges from green (most efficient) to red (least efficient)
+  relative to the other active NRP models. Tooltips show the underlying watts, tok/s, and
+  GPU hardware for context.</p>
+</div>
+
+<h3>Cumulative CO₂ and cluster CO₂/token (time-series view)</h3>
+<p>
+  For the time-series charts, we query the Prometheus range API at adaptive resolution
+  (5-minute steps for 24 h, hourly for 7 d, 6-hourly for 30 d),
+  apply the same per-node intensity to each sample, and integrate:
+</p>
+<pre><code>CO₂_kg_cumulative = Σ (P_watts_i × intensity_i × Δt_hrs / 1000)
+
+-- Total token rate used as denominator for cluster-wide CO₂/token:
+sum by (namespace, container) (
+  rate(vllm:generation_tokens_total[5m]) + rate(vllm:prompt_tokens_total[5m])
+)</code></pre>
+
+<h2>Limitations and Future Work</h2>
+<ul style="color:#cbd5e1; padding-left:1.5rem; margin:0.5rem 0 1rem;">
+  <li>CPU, DRAM, and network power are excluded (typically adds 15–30% to total)</li>
+  <li>Datacenter PUE (Power Usage Effectiveness) is not applied (adds 10–50%)</li>
+  <li>Carbon intensity values are annual averages; real-time grid mix varies hour-to-hour</li>
+  <li>Nodes not matching hostname or namespace patterns fall back to the California (CAMX) average</li>
+  <li>DCGM reports a single power reading per GPU; we cannot decompose energy into prefill vs
+    decode phases on the NRP side</li>
+  <li>The commercial frontier model spec is an informed estimate, not a known architecture.
+    No empirical per-token energy measurement exists for GPT-4, Claude 3/3.5/3.7, or Gemini 1.5/2.
+    The closest empirical anchor is Google's production measurement of 0.24 Wh/prompt for Gemini
+    Apps (arXiv:2508.15734). Our physics-based estimate is broadly consistent with this and with
+    independent bottom-up estimates (0.34 Wh median, arXiv:2509.20241)</li>
+  <li>Decode marginal energy (6 J/token) assumes low batch matching typical NRP traffic;
+    commercial providers batching hundreds of concurrent requests achieve lower per-token
+    decode costs, but also require the same or greater hosting floor</li>
+  <li>Agentic energy amplification is highly framework-dependent: measured research-grade
+    frameworks show 62–137× energy vs single-turn (arXiv:2506.04301); production systems
+    are likely lower but remain poorly characterized in the literature</li>
+  <li>The eGRID intensity table in <code>internal/carbon/intensity.go</code> will be updated as new annual data is published</li>
+</ul>
+<p>
+  For a more complete lifecycle analysis including training, hardware manufacturing, and
+  cooling overhead, see the references below.
+</p>
+
+<h2>References</h2>
+<table>
+  <tr>
+    <th>Source</th><th>Key contribution</th>
+  </tr>
+  <tr>
+    <td><a href="https://doi.org/10.1145/3630106.3658542" target="_blank">Luccioni, Jernite &amp; Strubell (2024). <em>Power Hungry Processing.</em> ACM FAccT.</a></td>
+    <td>Per-query energy &amp; CO₂ measurements for open LLMs (BLOOMz, Flan-T5, etc.)</td>
+  </tr>
+  <tr>
+    <td><a href="https://arxiv.org/abs/2601.22357" target="_blank">Delavande, Pierrard &amp; Luccioni (2025). <em>Small Talk, Big Impact.</em> arXiv.</a></td>
+    <td>Per-token energy decomposition: prefill vs. decode scaling; basis for J/token envelope estimates</td>
+  </tr>
+  <tr>
+    <td><a href="https://arxiv.org/abs/2104.10350" target="_blank">Patterson et al. (2021). <em>Carbon Emissions and Large Neural Network Training.</em> arXiv.</a></td>
+    <td>GPT-3 training energy (1,287 MWh); location &amp; hardware efficiency analysis</td>
+  </tr>
+  <tr>
+    <td><a href="https://arxiv.org/abs/2304.03271" target="_blank">Li et al. (2023). <em>Making AI Less Thirsty.</em> arXiv.</a></td>
+    <td>GPT-3 inference water and energy footprint estimates</td>
+  </tr>
+  <tr>
+    <td><a href="https://eta.lbl.gov/publications/powering-intelligence-analyzing" target="_blank">Shehabi et al. (2024). <em>Powering Intelligence.</em> Lawrence Berkeley National Laboratory.</a></td>
+    <td>US AI data center energy projections; efficiency trajectories</td>
+  </tr>
+  <tr>
+    <td><a href="https://www.iea.org/reports/electricity-2024" target="_blank">IEA (2024). <em>Electricity 2024.</em></a></td>
+    <td>Global data center energy (460 TWh 2022, &gt;1000 TWh by 2026); ChatGPT ≈ 10× Google search</td>
+  </tr>
+  <tr>
+    <td><a href="https://www.epa.gov/egrid" target="_blank">US EPA eGRID (2022).</a></td>
+    <td>Regional grid carbon intensity values used in this dashboard</td>
+  </tr>
+  <tr>
+    <td><a href="https://github.com/mlco2/codecarbon" target="_blank">Lottick et al. — CodeCarbon project.</a></td>
+    <td>Open-source framework for tracking ML carbon emissions; inspiration for this work</td>
+  </tr>
+  <tr>
+    <td><a href="https://arxiv.org/abs/2310.03003" target="_blank">Samsi et al. (2023). <em>From Words to Watts.</em> arXiv.</a></td>
+    <td>Foundational empirical measurement of LLM inference energy on A100/V100; LLaMA-65B: 3–4 J/output token</td>
+  </tr>
+  <tr>
+    <td><a href="https://arxiv.org/abs/2512.03024" target="_blank">TokenPowerBench (2025). arXiv:2512.03024.</a></td>
+    <td>Comprehensive H100 benchmark of LLM inference power; MoE models ~2–3× more energy-efficient per token than dense equivalents</td>
+  </tr>
+  <tr>
+    <td><a href="https://arxiv.org/abs/2508.15734" target="_blank">Google (2025). <em>Measuring the environmental impact of delivering AI at Google Scale.</em> arXiv.</a></td>
+    <td>Only production-measured energy figure for a frontier commercial model: <strong>0.24 Wh median per Gemini prompt</strong> (August 2025); 33× efficiency gain year-over-year</td>
+  </tr>
+  <tr>
+    <td><a href="https://arxiv.org/abs/2509.20241" target="_blank">Luccioni et al. (2025). <em>Energy Use of AI Inference: Efficiency Pathways and Test-Time Compute.</em> arXiv.</a></td>
+    <td>Best bottom-up estimate for frontier &gt;200B models: <strong>0.34 Wh/query median</strong> (IQR: 0.18–0.67); agentic 15× token multiplier → ~13× energy increase</td>
+  </tr>
+  <tr>
+    <td><a href="https://arxiv.org/abs/2506.04301" target="_blank"><em>The Cost of Dynamic Reasoning.</em> (2025). arXiv.</a></td>
+    <td>Empirical measurement of agentic AI energy: Reflexion/LATS workflows consume <strong>62–137× more energy</strong> than single-turn baseline on same model</td>
+  </tr>
+  <tr>
+    <td><a href="https://arxiv.org/abs/2601.14470" target="_blank">Tokenomics (2026). arXiv.</a></td>
+    <td>Empirical tokenomics of multi-agent software engineering: 53.9% input tokens, ~2:1 input:output ratio; code review consumes 59% of all tokens</td>
+  </tr>
+  <tr>
+    <td><a href="https://arxiv.org/abs/2511.05597" target="_blank"><em>From Prompts to Power.</em> (2025). arXiv.</a></td>
+    <td>32,500 empirical measurements; confirms decode phase dominates energy (~96–97% of total); output tokens 10–30× more expensive per token than input</td>
+  </tr>
+  <tr>
+    <td><a href="https://arxiv.org/abs/2505.09598" target="_blank"><em>How Hungry is AI?</em> (2025). arXiv.</a></td>
+    <td>GPT-4o estimates via API timing + hardware modeling: 0.42 Wh (short query) to 2.9 Wh (long query); cross-model comparison framework</td>
+  </tr>
+  <tr>
+    <td><a href="https://epoch.ai/gradient-updates/how-much-energy-does-chatgpt-use" target="_blank">Epoch AI (2024). <em>How much energy does ChatGPT use?</em></a></td>
+    <td>Transparent bottom-up estimate for GPT-4o: ~0.3 Wh per typical query; based on leaked architecture specs and H100 TDP modeling</td>
+  </tr>
+  <tr>
+    <td><a href="https://openrouter.ai/state-of-ai" target="_blank">a16z / OpenRouter (2025). <em>State of AI: 100T Token Study.</em></a></td>
+    <td>Empirical API traffic data: prompt lengths grew ~4× (2024–2025); programming prompts routinely exceed 20,000 input tokens; agentic use dominates growth</td>
+  </tr>
+</table>
+
+<h2>Source Code</h2>
+<p>
+  This dashboard is open source:
+  <a href="https://github.com/boettiger-lab/nrp-carbon-api" target="_blank">github.com/boettiger-lab/nrp-carbon-api</a>.
+  The carbon intensity lookup table is in
+  <code>internal/carbon/intensity.go</code>.
+</p>
+
+</main>
+<footer>
+  NRP Carbon Dashboard · <a href="/">Back to Dashboard</a>
+</footer>
+</body>
+</html>
