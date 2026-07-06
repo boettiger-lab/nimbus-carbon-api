@@ -9,7 +9,7 @@ queued for. nimbus is the opposite — one personal GB10, bursty single-user
 traffic, and idling low is a hardware strength (power-gating working as
 designed), not a failure.
 
-Concretely, three problems trace back to this mismatch:
+Concretely, four problems trace back to this mismatch:
 
 1. **Wrong framing.** The "vs. Commercial frontier" comparison drives card
    border color and an "efficiency verdict," and the J/token chart's own
@@ -30,6 +30,12 @@ Concretely, three problems trace back to this mismatch:
    it plots an instantaneous rate (kg CO₂/hr), not a cumulative total. For
    nimbus that rate is tiny (~2 g/hr) and nearly flat, so with
    `beginAtZero` the line hugs the bottom axis and looks blank.
+4. **Live tok/s figures don't match observed reality.** The "Output
+   tok/s"/"Input tok/s" fields use a 5-minute `rate()` window sized for
+   continuous multi-tenant traffic; for nimbus's bursty single-user
+   traffic this both goes stale within minutes of a burst ending and
+   dilutes the reported rate far below the real instantaneous speed while
+   a burst is happening. See change 5.
 
 Separately, the user wants relatable everyday reference frames (car miles,
 appliance runtime, etc.) for the CO₂ numbers, in the style of CodeCarbon —
@@ -38,9 +44,10 @@ on their own.
 
 ## Scope
 
-Frontend-only: `cmd/static/dashboard.html` and `cmd/static/methodology.html`
-in `boettiger-lab/nimbus-carbon-api`. No Go backend or API changes — every
-field the redesign needs (`power_watts_avg_24h`,
+Mostly frontend (`cmd/static/dashboard.html`, `cmd/static/methodology.html`),
+plus one small, same-theme Go backend fix (change 5 below,
+`internal/scraper/scraper.go`). Changes 1-4 need no backend/API changes —
+every field they need (`power_watts_avg_24h`,
 `prompt_tokens_per_sec_avg_24h`, `generation_tokens_per_sec_avg_24h`, and
 the `co2_grams_per_hour` timeseries) already exists in current API
 responses.
@@ -126,12 +133,53 @@ responses.
   entry in `methodology.html`'s reference table (mirroring how the EPA
   eGRID intensity is already cited there) so the numbers are traceable.
 
+### 5. Narrow the live token-rate window
+
+A separate, same-theme bug, found while testing this design against the
+live dashboard: the "Output tok/s"/"Input tok/s" fields on `/api/v1/carbon`
+(and the "active" badge threshold, and the CO₂/token bar chart's "current
+5-min rate" diamond marker) come from `internal/scraper/scraper.go`'s
+`queryTokens()`, which uses `rate(vllm:generation_tokens_total[5m])` and
+`rate(vllm:prompt_tokens_total[5m])`.
+
+Verified directly against nimbus's live Prometheus (raw counter deltas
+during an actual generation burst in this session): real instantaneous
+decode speed was 30-133 tok/s, but `rate([5m])` read 0 within minutes of
+the burst ending, and would have read a heavily diluted value (roughly
+1-5 tok/s) even *during* the burst — a 5-minute window averages a
+20-second burst across the surrounding 280 seconds of idle time on either
+side. This is the same root problem as changes 1-4 (metrics windowed for
+continuous multi-tenant traffic, wrong for a bursty personal box) but it's
+a backend query fix, not a presentation fix.
+
+Confirmed this same code pattern exists in the current live
+`nrp-carbon-api` (`rate(vllm:generation_tokens_total[5m])`,
+`rate(vllm:prompt_tokens_total[5m])` in its own `queryTokens()`) — it's not
+a nimbus-introduced bug, but nimbus's always-bursty single-user traffic
+pattern is what makes it visible. NRP's busier models see close to
+continuous traffic (checked live: several models there report nonzero
+`rate([5m])` simultaneously), so the same window doesn't distort them the
+same way. Not something to fix upstream as part of this project.
+
+- Change both `rate(...[5m])` windows in `queryTokens()` to `rate(...[2m])`
+  — still ≥4x the 30s scrape interval (Prometheus's own recommended
+  minimum for stable `rate()` over a counter), but far less dilution for
+  burst-shaped traffic.
+- Leave every other `rate(...[5m])` call in the file untouched
+  (`backfill()`'s and `ClusterTimeSeries()`'s range queries) — those feed
+  long-run 24h/7d averages and time-series charts, where the window size is
+  tied to the query step and a moving average's long-run mean isn't
+  distorted by this effect the way a single live snapshot is.
+
 ## Out of scope
 
-- No backend/API changes — this is presentation-layer only.
+- No change to `backfill()` or `ClusterTimeSeries()`'s query windows —
+  see change 5's last bullet for why.
 - No all-time/lifetime cumulative counter — the reference frames use
   whichever window (24h/7d/30d) is currently selected, not a separate
   persistent total.
 - No change to the model-card's absolute CO₂/hr coloring (`co2Color()`) —
   that's an absolute-magnitude indicator, not a comparison-based verdict,
   and isn't part of the framing problem this design addresses.
+- No attempt to fix or report the same latent windowing issue upstream in
+  `nrp-carbon-api` — out of scope for this project.
