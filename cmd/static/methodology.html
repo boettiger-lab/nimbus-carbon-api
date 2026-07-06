@@ -348,18 +348,21 @@ Ratio: 5,492 / 783 = 7.0× — nimbus uses 7× less energy for the same tokens.<
   watts, tok/s, and GPU hardware for context.</p>
 </div>
 
-<h3>Cumulative CO₂ and cluster CO₂/token (time-series view)</h3>
+<h3>Cumulative CO₂ emissions (time-series view)</h3>
 <p>
-  For the time-series charts, we query the Prometheus range API at adaptive resolution
-  (5-minute steps for 24 h, hourly for 7 d, 6-hourly for 30 d),
-  apply the same per-node intensity to each sample, and integrate:
+  The backend's timeseries endpoint queries the Prometheus range API at
+  adaptive resolution (5-minute steps for 24 h, hourly for 7 d, 6-hourly for
+  30 d) and returns <code>co2_grams_per_hour</code> at each step (already
+  computed server-side as <code>power_watts × 0.198</code>, nimbus's fixed
+  grid intensity). The dashboard then integrates that rate client-side using
+  the rectangle rule, running-summed over the selected window:
 </p>
-<pre><code>CO₂_kg_cumulative = Σ (P_watts_i × intensity_i × Δt_hrs / 1000)
-
--- Total token rate used as denominator for cluster-wide CO₂/token:
-sum by (namespace, container) (
-  rate(vllm:generation_tokens_total[5m]) + rate(vllm:prompt_tokens_total[5m])
-)</code></pre>
+<pre><code>total_g = Σ (co2_grams_per_hour_i × step_hours)</code></pre>
+<p>
+  This total only grows — it never resets within a window — so the chart
+  climbs steadily even while nimbus is mostly idle, rather than looking flat
+  or empty the way a tiny, nearly-constant rate does.
+</p>
 
 <h2>Limitations and Future Work</h2>
 <ul style="color:#cbd5e1; padding-left:1.5rem; margin:0.5rem 0 1rem;">

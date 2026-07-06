@@ -170,6 +170,7 @@ let lineChart = null;
 let currentRange = '7d';
 let barMode = 'co2';
 let lastData = null;
+let lastEmissionsTotalGrams = 0;
 
 function chartColors() {
   const light = document.body.classList.contains('light');
@@ -490,7 +491,19 @@ function render(data) {
   }).join('');
 }
 
-// CO₂/token over time — only points where tokens were being generated.
+// The backend always emits step as one of "5m0s", "1h0m0s", "6h0m0s"
+// (Go's time.Duration.String()) -- parse the h/m/s components present.
+function parseStepSeconds(stepStr) {
+  const h = /(\d+)h/.exec(stepStr);
+  const m = /(\d+)m/.exec(stepStr);
+  const s = /(\d+)s/.exec(stepStr);
+  return (h?+h[1]*3600:0) + (m?+m[1]*60:0) + (s?+s[1]:0);
+}
+
+// Cumulative CO₂ emissions over the selected window — integrates the
+// co2_grams_per_hour rate series using the rectangle rule (rate × step
+// duration), running-summed. Always populated as long as the range has any
+// points, even during idle periods (the total simply grows slowly).
 function renderTimeSeries(data) {
   const pts = data.points || [];
   if (!pts.length) return;
@@ -504,59 +517,49 @@ function renderTimeSeries(data) {
     return d.toLocaleDateString([],{month:'short',day:'numeric'});
   };
 
-  // Use CO₂/token where available; show null (gap) during idle periods
-  const tokenPts  = pts.filter(p => p.co2_mg_per_token > 0);
-  const hasTokens = tokenPts.length > 0;
+  const stepHours = parseStepSeconds(data.step) / 3600;
+  let running = 0;
+  const cumulativeGrams = pts.map(p => {
+    running += p.co2_grams_per_hour * stepHours;
+    return +running.toFixed(2);
+  });
+  lastEmissionsTotalGrams = running;
 
-  const datasets = hasTokens ? [
-    {
-      label: 'Cluster avg CO₂/token (mg)',
-      data: pts.map(p => p.co2_mg_per_token > 0 ? +p.co2_mg_per_token.toFixed(3) : null),
-      borderColor: '#22c55e',
-      backgroundColor: 'rgba(34,197,94,0.08)',
-      fill: true, tension: 0.3, pointRadius: 0, spanGaps: false,
-    },
-  ] : [
-    // Fallback: show CO₂/hr when no token data in range
-    {
-      label: 'CO₂ rate (kg/hr)',
-      data: pts.map(p => +(p.co2_grams_per_hour/1000).toFixed(4)),
-      borderColor: '#6366f1', backgroundColor: 'rgba(99,102,241,0.1)',
+  const totalLabel = running >= 1000
+    ? (running/1000).toFixed(2) + ' kg CO₂e'
+    : running.toFixed(1) + ' g CO₂e';
+
+  const chartData = {
+    labels: pts.map(mkLabel),
+    datasets: [{
+      label: 'Cumulative CO₂ (g)',
+      data: cumulativeGrams,
+      borderColor: '#6366f1',
+      backgroundColor: 'rgba(99,102,241,0.1)',
       fill: true, tension: 0.3, pointRadius: 0,
-    }
-  ];
-
-  const avgToken = hasTokens
-    ? (tokenPts.reduce((s,p)=>s+p.co2_mg_per_token,0)/tokenPts.length).toFixed(2) + ' mg CO₂/token avg'
-    : 'no active generation in range — showing CO₂/hr';
-
-  const yTitle = hasTokens ? 'mg CO₂ / token' : 'kg CO₂ / hr';
-  const tooltipFmt = hasTokens
-    ? c => ` ${c.dataset.label}: ${c.parsed.y != null ? c.parsed.y.toFixed(3) : '—'} mg/token`
-    : c => ` ${c.parsed.y.toFixed(3)} kg CO₂/hr`;
-
-  const chartData = { labels: pts.map(mkLabel), datasets };
+    }],
+  };
   const lc = chartColors();
   const options = {
     responsive: true,
     interaction: { mode:'index', intersect:false },
     plugins: {
       legend: { labels:{ color:lc.legend, font:{size:10}, boxWidth:12 } },
-      title: { display:true, text:`${rangeLabel} — ${avgToken}`,
+      title: { display:true, text:`${rangeLabel} — Total: ${totalLabel}`,
                color:lc.tick, font:{size:11, weight:'normal'}, padding:{bottom:8} },
-      tooltip: { callbacks: { label: tooltipFmt } }
+      tooltip: { callbacks: { label: c => ` ${c.parsed.y.toFixed(2)} g CO₂ cumulative` } }
     },
     scales: {
       x: { ticks:{color:lc.tick,font:{size:10},maxTicksLimit:10}, grid:{color:lc.grid} },
       y: { ticks:{color:lc.tick,font:{size:10}}, grid:{color:lc.grid},
-           title:{display:true, text:yTitle, color:lc.tick, font:{size:10}},
+           title:{display:true, text:'g CO₂ (cumulative)', color:lc.tick, font:{size:10}},
            beginAtZero:true }
     }
   };
 
   if (lineChart) {
     lineChart.data = chartData;
-    lineChart.options.plugins.title.text = `${rangeLabel} — ${avgToken}`;
+    lineChart.options.plugins.title.text = `${rangeLabel} — Total: ${totalLabel}`;
     lineChart.update('none');
   } else {
     lineChart = new Chart(document.getElementById('lineChart'), { type:'line', data:chartData, options });
