@@ -314,33 +314,38 @@ Ratio: 5,492 / 783 = 7.0× — nimbus uses 7× less energy for the same tokens.<
   equivalent (purple band), with a breakdown of idle floor vs. marginal power.</li>
 </ul>
 
-<h3>Energy efficiency across models (J/token view)</h3>
+<h3>Energy per token across models (J/token view)</h3>
 <p>
   The bar chart can be toggled to show <strong>J/token</strong> (joules per token) —
-  a hardware- and grid-neutral measure of how efficiently each model converts GPU power
-  into tokens:
+  a hardware- and grid-neutral measure of energy spent per token, computed from
+  24-hour averages (the same window the CO₂/token chart uses):
 </p>
-<pre><code>J_per_token = power_watts / total_tokens_per_sec</code></pre>
+<pre><code>J_per_token = power_watts_avg_24h / (prompt_tokens_per_sec_avg_24h + generation_tokens_per_sec_avg_24h)</code></pre>
 <p>
   Unlike CO₂/token, this metric is independent of grid carbon intensity, making it
-  directly comparable across models regardless of where they are hosted. A model
-  with high J/token is underutilized relative to its GPU allocation — the GPUs draw
-  near-idle power while producing few tokens. Key drivers of high J/token include:
+  directly comparable across models regardless of where they are hosted. J/token reflects
+  batch size and workload as much as it reflects GPU health — it is <strong>not</strong> a
+  "utilization" verdict. A personal, single-user box naturally runs higher J/token than a
+  heavily-batched datacenter server, because personal single-stream inference is
+  latency-bound, not throughput-bound: there's no queue of other requests to batch
+  alongside, and there shouldn't be. Key drivers of J/token include:
 </p>
 <ul style="color:#cbd5e1; padding-left:1.5rem; margin:0.5rem 0 1rem;">
-  <li><strong>Low traffic:</strong> GPU idle power dominates when few tokens are being processed</li>
-  <li><strong>Oversized allocation:</strong> More GPUs than needed for the model's actual demand</li>
+  <li><strong>Batch size:</strong> more concurrent requests amortize the same idle power
+  over more tokens — a difference in workload, not a problem to fix on a personal box</li>
+  <li><strong>Traffic level:</strong> idle power is a larger share of the total when fewer
+  tokens are being processed in a given window</li>
   <li><strong>Model architecture:</strong> Dense models activate all parameters on every token,
   while Mixture-of-Experts (MoE) models route each token through a subset (~20%) of total
   weights. A dense 31B model may therefore have higher J/token than a 397B MoE, because the
   MoE only activates ~60B parameters per token</li>
 </ul>
 <div class="callout">
-  <p><strong>Note:</strong> J/token only appears for models with &gt;5 tok/s total throughput.
-  Below this threshold the metric is dominated by idle power and not meaningful as an
-  efficiency measure. Bar color ranges from green (most efficient) to red (least efficient)
-  relative to the other active nimbus models. Tooltips show the underlying watts, tok/s, and
-  GPU hardware for context.</p>
+  <p><strong>Note:</strong> J/token only appears for models with combined 24h-avg
+  prompt+generation throughput above 0.1 tok/s. Bars are colored on a single-hue magnitude
+  scale (no green/red judgment) — lower is more energy per output, but is not itself
+  "better" or "worse" without knowing the workload. Tooltips show the underlying 24h-avg
+  watts, tok/s, and GPU hardware for context.</p>
 </div>
 
 <h3>Cumulative CO₂ and cluster CO₂/token (time-series view)</h3>
