@@ -43,6 +43,7 @@
 
   .chart-wrap{background:var(--surface);border:1px solid var(--border);border-radius:.75rem;padding:1.2rem;margin-bottom:1.75rem;}
   .chart-wrap canvas{max-height:240px;}
+  .ref-frames{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:.65rem;margin-top:1rem;}
 
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:.9rem;}
   .card{background:var(--surface);border:1px solid var(--border);border-radius:.75rem;padding:1.1rem;border-left:3px solid var(--border);}
@@ -134,6 +135,7 @@
       </div>
     </div>
     <canvas id="lineChart"></canvas>
+    <div class="ref-frames" id="ref-frames"></div>
   </div>
 
   <div class="chart-wrap">
@@ -237,6 +239,13 @@ const FRONTIER = {
   decodeJPerToken: 6.0,
 };
 const FRONTIER_IDLE_W = FRONTIER.numGPUs * FRONTIER.idleWattsPerGPU; // 5400 W
+
+// Everyday reference frames for CO2 totals, in the style of CodeCarbon.
+// Sources cited in /methodology.
+const REF_CAR_G_PER_MILE = 404;       // EPA: average gasoline passenger vehicle, g CO2/mile
+const REF_PHONE_CHARGE_G = 8.22;      // g CO2 per full smartphone charge (commonly cited estimate)
+const REF_FRIDGE_WATTS = 150;         // average household refrigerator draw, W
+const REF_TREE_KG_PER_MONTH = 1.75;   // kg CO2 absorbed per mature tree per month (rough estimate)
 
 function frontierWatts(promptTokPerSec, genTokPerSec) {
   return FRONTIER_IDLE_W
@@ -524,6 +533,7 @@ function renderTimeSeries(data) {
     return +running.toFixed(2);
   });
   lastEmissionsTotalGrams = running;
+  renderReferenceFrames(running);
 
   const totalLabel = running >= 1000
     ? (running/1000).toFixed(2) + ' kg CO₂e'
@@ -564,6 +574,39 @@ function renderTimeSeries(data) {
   } else {
     lineChart = new Chart(document.getElementById('lineChart'), { type:'line', data:chartData, options });
   }
+}
+
+// Converts a cumulative CO2 total (grams) into a few widely-cited everyday
+// equivalents. The fridge comparison intentionally uses nimbus's own grid
+// intensity (from the current model data) rather than a separate reference
+// intensity, so it's an apples-to-apples "same grid, different appliance"
+// comparison.
+function renderReferenceFrames(totalGrams) {
+  const el = document.getElementById('ref-frames');
+  if (!el) return;
+
+  const gridIntensity = (lastData && lastData.models && lastData.models[0])
+    ? lastData.models[0].carbon_intensity_kg_per_kwh
+    : 0.198;
+
+  const miles = totalGrams / REF_CAR_G_PER_MILE;
+  const charges = totalGrams / REF_PHONE_CHARGE_G;
+  const fridgeGPerHour = (REF_FRIDGE_WATTS / 1000) * gridIntensity * 1000; // kW × kg/kWh × 1000 g/kg
+  const fridgeMinutes = fridgeGPerHour > 0 ? (totalGrams / fridgeGPerHour) * 60 : 0;
+  const treeMonths = totalGrams / (REF_TREE_KG_PER_MONTH * 1000);
+
+  const tiles = [
+    { label: 'Miles driven', value: fmt(miles, miles < 1 ? 3 : 1), unit: 'gas car (EPA avg)' },
+    { label: 'Phone charges', value: fmt(charges, charges < 1 ? 2 : 0), unit: 'full charges' },
+    { label: 'Fridge runtime', value: fmt(fridgeMinutes, fridgeMinutes < 1 ? 2 : 0), unit: 'minutes' },
+    { label: 'Tree absorption', value: fmt(treeMonths, 3), unit: 'tree-months' },
+  ];
+  el.innerHTML = tiles.map(t => `
+    <div class="stat">
+      <div class="stat-label">${t.label}</div>
+      <div class="stat-value">${t.value}</div>
+      <div class="stat-unit">${t.unit}</div>
+    </div>`).join('');
 }
 
 document.querySelectorAll('#time-range-tabs .range-tab').forEach(btn => {

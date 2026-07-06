@@ -468,6 +468,26 @@ Ratio: 5,492 / 783 = 7.0× — nimbus uses 7× less energy for the same tokens.<
   </tr>
 </table>
 
+<h2>Everyday Reference Frames</h2>
+<p>
+  Absolute CO₂ figures for a single, efficient GB10 node are small (grams,
+  not kilograms) and don't mean much in isolation. The dashboard converts
+  the cumulative total for the selected window (see "Cumulative CO₂
+  emissions" above) into a few widely-cited everyday equivalents, in the
+  style of <a href="https://github.com/mlco2/codecarbon" target="_blank">CodeCarbon</a>:
+</p>
+<table>
+  <tr><th>Reference</th><th>Conversion factor</th><th>Source</th></tr>
+  <tr><td>Miles driven (gas car)</td><td>404 g CO₂/mile</td><td><a href="https://www.epa.gov/greenvehicles/greenhouse-gas-emissions-typical-passenger-vehicle" target="_blank">EPA, average passenger vehicle</a></td></tr>
+  <tr><td>Smartphone charges</td><td>8.22 g CO₂/charge</td><td>Commonly cited estimate (a full charge is roughly 0.012 kWh)</td></tr>
+  <tr><td>Refrigerator runtime</td><td>~150 W average draw</td><td>Typical household refrigerator; converted to grams using nimbus's own 0.198 kg CO₂/kWh grid intensity, for a like-for-like "same grid, different appliance" comparison</td></tr>
+  <tr><td>Tree-months of absorption</td><td>~1.75 kg CO₂/month/tree</td><td>Common carbon-calculator estimate — the roughest of the four; real absorption varies significantly by species, age, and region</td></tr>
+</table>
+<div class="callout">
+  <p><strong>Note:</strong> these are meant to build intuition for very small
+  numbers, not as precise offsets.</p>
+</div>
+
 <h2>Source Code</h2>
 <p>
   This dashboard is open source:
