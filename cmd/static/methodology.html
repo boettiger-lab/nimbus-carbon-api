@@ -250,29 +250,34 @@ CO₂_mg/token = P_watts × intensity_kg/kWh × (1e6 mg/kg) / (3.6e6 J/kWh) / to
 ratio = frontier_watts / nrp_measured_watts</code></pre>
 <p>
   This formula is applied to each nimbus model using its <strong>actual observed</strong>
-  prompt and generation token rates. The comparison is shown as a watts bar on each model
-  card and as a CO₂/token bar chart (colored by energy ratio) across all models.
+  prompt and generation token rates. The comparison is shown as a plain-text watts bar on
+  each model card, visible only while the model is actively generating (24h-avg combined
+  tok/s above a small threshold) — not as a colored verdict, and not on the CO₂/token bar
+  chart, which is a separate, unrelated, always-rendered absolute measurement.
 </p>
 
-<h3>Example: Qwen3.5-397B at low traffic</h3>
-<pre><code>nimbus measured: 783 W  (8× A100, real DCGM reading)
-Prompt rate:       3 tok/s
-Generation rate:  15 tok/s
+<h3>Example: nimbus at typical light traffic</h3>
+<pre><code>nimbus measured: 11 W  (1× GB10, real DCGM reading)
+Prompt rate:      40 tok/s
+Generation rate:   1 tok/s
 
 Commercial frontier equivalent:
   Idle floor:    24 × 225 = 5,400 W
-  Prefill:        3 × 0.5 =     2 W
-  Decode:        15 × 6.0 =    90 W
-  Total:                    5,492 W
+  Prefill:       40 × 0.5 =    20 W
+  Decode:         1 × 6.0 =     6 W
+  Total:                     5,426 W
 
-Ratio: 5,492 / 783 = 7.0× — nimbus uses 7× less energy for the same tokens.</code></pre>
+Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.</code></pre>
 
 <div class="callout">
-  <p><strong>Why this is fair:</strong> Both sides include hosting costs. The nimbus model
-  draws ~783 W to keep 8× A100 GPUs powered; the commercial frontier would draw ~5,400 W just to
-  keep 24× H100 GPUs powered. At low traffic, both clusters are underutilized — the
-  comparison reflects the real energy cost of maintaining each capability, not an idealized
-  marginal-only estimate for one side.</p>
+  <p><strong>Why this is fair:</strong> Both sides include hosting costs. nimbus draws
+  ~11 W to keep its single GB10 powered; the commercial frontier would draw ~5,400 W just
+  to keep 24× H100 GPUs powered and its models loaded in memory. The comparison reflects
+  the real energy cost of maintaining each capability, not an idealized marginal-only
+  estimate for one side — and it is not a judgment of "utilization" on either side: nimbus
+  idling low is exactly what a well-designed single-user desktop-class chip should do, and
+  a large commercial cluster's idle floor reflects it serving many concurrent users, not
+  being poorly managed.</p>
 </div>
 <div class="callout">
   <p><strong>What this doesn't measure:</strong> nimbus figures are GPU power only (no CPU,
