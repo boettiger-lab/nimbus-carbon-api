@@ -46,11 +46,6 @@
 
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:.9rem;}
   .card{background:var(--surface);border:1px solid var(--border);border-radius:.75rem;padding:1.1rem;border-left:3px solid var(--border);}
-  .card.ratio-great{border-left-color:var(--green);}   /* < 50% of commercial */
-  .card.ratio-good {border-left-color:#86efac;}         /* 50–80% of commercial */
-  .card.ratio-warn {border-left-color:var(--orange);}   /* 80–100%: at commercial level */
-  .card.ratio-bad  {border-left-color:var(--red);}      /* > 100%: worse than commercial */
-  .card.ratio-idle {border-left-color:var(--border);}   /* no token data (idle) */
   .card-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:.65rem;}
   .model-name{font-size:.83rem;font-weight:600;line-height:1.3;word-break:break-all;}
   .model-name.unknown{color:var(--muted);font-style:italic;}
@@ -97,9 +92,7 @@
   /* commercial midpoint tick */
   .token-cmp-tick{position:absolute;top:-3px;width:2px;height:24px;background:#6366f1;border-radius:1px;}
   .token-cmp-legend{display:flex;justify-content:space-between;margin-top:.35rem;font-size:.65rem;color:var(--muted);}
-  .token-cmp-ratio{font-size:.72rem;margin-top:.3rem;font-weight:600;}
-  .token-cmp-ratio.better{color:var(--green);}
-  .token-cmp-ratio.worse {color:var(--orange);}
+  .token-cmp-ratio{font-size:.72rem;margin-top:.3rem;font-weight:600;color:var(--text);}
 
   .workload-note{font-size:.67rem;color:var(--muted);margin:.35rem 0 .7rem;padding:.4rem .75rem;background:rgba(99,102,241,.07);border:1px solid var(--border);border-left:2px solid var(--accent);border-radius:.4rem;}
   footer{text-align:center;padding:2rem;font-size:.71rem;color:var(--muted);}
@@ -250,21 +243,6 @@ function frontierWatts(promptTokPerSec, genTokPerSec) {
        + genTokPerSec    * FRONTIER.decodeJPerToken;
 }
 
-// Card border: energy ratio (nimbus / Commercial frontier equivalent).
-// Uses 24h averages to match the CO₂/token bar chart window; falls back to
-// instantaneous 5-min values for pods that don't yet have 24h history.
-function energyRatioClass(m) {
-  const nrpW = m.power_watts_avg_24h || m.power_watts;
-  if (nrpW < 1) return 'ratio-idle';
-  const prompt = m.prompt_tokens_per_sec_avg_24h ?? m.prompt_tokens_per_sec ?? 0;
-  const gen = m.generation_tokens_per_sec_avg_24h ?? m.generation_tokens_per_sec ?? 0;
-  const fw = frontierWatts(prompt, gen);
-  const r = nrpW / fw;
-  if (r < 0.15) return 'ratio-great';
-  if (r < 0.35) return 'ratio-good';
-  if (r < 0.70) return 'ratio-warn';
-  return 'ratio-bad';
-}
 function intensityColor(kg){ return kg<=.25?'#22c55e':kg<=.40?'#eab308':kg<=.55?'#f97316':'#ef4444'; }
 
 // nimbus has exactly one fixed location — Berkeley, CA (CAMX eGRID
@@ -411,22 +389,26 @@ function render(data) {
   // Model cards
   document.getElementById('cards').innerHTML = models.map(m=>{
     const active = m.tokens_per_sec > 0.1;
-    const ic  = energyRatioClass(m);
     const cc  = co2Color(m.co2_grams_per_hour);
     const dot = intensityColor(m.carbon_intensity_kg_per_kwh);
     const promptPct = active && m.tokens_per_sec > 0 ? (m.prompt_tokens_per_sec / m.tokens_per_sec * 100) : null;
 
-    // Watts comparison: nimbus measured vs Commercial frontier equivalent for the same tokens.
-    // Use 24h averages so this matches the CO₂/token bar chart window; fall back to
-    // instantaneous 5-min values for pods without 24h history yet.
+    // Frontier-model comparison: shown only while actively generating (24h-avg
+    // combined tok/s > 1) — while idle this is omitted entirely, not shown as
+    // good or bad. Plain informational text/visualization only, no color
+    // verdict: nimbus's absolute power draw is real regardless of how it
+    // compares to a hypothetical 24-GPU commercial cluster, and idling low is
+    // expected behavior for this hardware, not something to judge either way.
     const avgPrompt = m.prompt_tokens_per_sec_avg_24h ?? m.prompt_tokens_per_sec ?? 0;
     const avgGen    = m.generation_tokens_per_sec_avg_24h ?? m.generation_tokens_per_sec ?? 0;
+    const isGenerating24h = (avgPrompt + avgGen) > 1;
     const fw   = frontierWatts(avgPrompt, avgGen);
     const nrpW = m.power_watts_avg_24h || m.power_watts;
     const has24h = m.power_watts_avg_24h != null && m.power_watts_avg_24h > 0;
     const windowLabel = has24h ? '24h avg' : '5-min';
     let wattsCmp = '';
-    if (nrpW > 0) {
+    let frontierMetric = '';
+    if (isGenerating24h && nrpW > 0) {
       const ratio = fw / nrpW;
       const nrpPct = Math.min(nrpW / fw * 100, 100).toFixed(1);
       const ratioText = ratio >= 1.05
@@ -434,26 +416,26 @@ function render(data) {
         : ratio < 0.95
           ? `${(1/ratio).toFixed(1)}× more energy than ${FRONTIER.label}`
           : `≈ same energy as ${FRONTIER.label}`;
-      const ratioClass = ratio >= 1.05 ? 'better' : 'worse';
       const fIdleW = FRONTIER_IDLE_W;
       const fMargW = fw - fIdleW;
       wattsCmp = `
         <div class="token-cmp">
           <div class="token-cmp-label">Power (${windowLabel}): nimbus vs. ${FRONTIER.label} for same tokens</div>
           <div class="token-cmp-track">
-            <div class="token-cmp-bar" style="width:${nrpPct}%;background:#22c55e;top:2px;height:14px;border-radius:2px"></div>
+            <div class="token-cmp-bar" style="width:${nrpPct}%;background:#6366f1;top:2px;height:14px;border-radius:2px"></div>
             <div style="position:absolute;top:2px;left:0;width:100%;height:14px;border-radius:2px;background:rgba(99,102,241,0.18)"></div>
           </div>
           <div class="token-cmp-legend">
-            <span style="color:#22c55e">nimbus: ${nrpW.toLocaleString(undefined,{maximumFractionDigits:0})} W</span>
+            <span style="color:var(--text)">nimbus: ${nrpW.toLocaleString(undefined,{maximumFractionDigits:0})} W</span>
             <span style="color:#6366f1">${FRONTIER.label}: ${fw.toLocaleString(undefined,{maximumFractionDigits:0})} W <span style="opacity:.6">(${fIdleW.toLocaleString()} idle + ${fMargW.toLocaleString(undefined,{maximumFractionDigits:0})} marginal)</span></span>
           </div>
-          <div class="token-cmp-ratio ${ratioClass}">${ratioText}</div>
+          <div class="token-cmp-ratio">${ratioText}</div>
         </div>`;
+      frontierMetric = `<div class="metric"><div class="metric-label">vs. ${FRONTIER.label}</div><div class="metric-value">${fmt(fw/nrpW,1)}×</div><div class="metric-unit">less energy · ${windowLabel}</div></div>`;
     }
 
     return `
-    <div class="card ${ic}">
+    <div class="card">
       <div class="card-header">
         <div class="model-name ${m.model_name?'':'unknown'}">${m.model_name||m.container}</div>
         <span class="badge ${active?'badge-active':'badge-idle'}">${active?'active':'idle'}</span>
@@ -468,7 +450,7 @@ function render(data) {
         <div class="metric"><div class="metric-label">CO₂ / token</div><div class="metric-value">${m.co2_mg_per_token?fmt(m.co2_mg_per_token,3):'—'}</div><div class="metric-unit">mg · 5 min${m.co2_mg_per_token_avg_24h ? ` · <span style="color:var(--muted)">24h avg: ${fmt(m.co2_mg_per_token_avg_24h,3)}</span>` : ''}</div></div>
         <div class="metric"><div class="metric-label">Input tok/s</div><div class="metric-value">${active?fmt(m.prompt_tokens_per_sec):'—'}</div><div class="metric-unit">tok/s prompt</div></div>
         <div class="metric"><div class="metric-label">Output tok/s</div><div class="metric-value">${active?fmt(m.generation_tokens_per_sec):'—'}</div><div class="metric-unit">tok/s generated</div></div>
-        <div class="metric"><div class="metric-label">vs. ${FRONTIER.label}</div><div class="metric-value ${fw/nrpW>=1.05?'green':fw/nrpW<0.95?'red':''}">${nrpW>0?fmt(fw/nrpW,1)+'×':'—'}</div><div class="metric-unit">${fw/nrpW>=1.05?'less energy':'more energy'} · ${windowLabel}</div></div>
+        ${frontierMetric}
       </div>
       ${wattsCmp}
       <div class="grid-intensity">

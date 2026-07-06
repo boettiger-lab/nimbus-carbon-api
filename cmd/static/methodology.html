@@ -287,7 +287,10 @@ Ratio: 5,492 / 783 = 7.0× — nimbus uses 7× less energy for the same tokens.<
 
 <h3>Dashboard visualizations</h3>
 <p>
-  The dashboard presents the frontier comparison in two ways:
+  The dashboard presents the frontier comparison in two ways, both shown only
+  while the model is actively generating (24h-avg combined tok/s > 1) — while
+  idle, neither is shown, since there is nothing to compare and idling low is
+  expected behavior for this hardware, not something to judge either way:
 </p>
 <ul style="color:#cbd5e1; padding-left:1.5rem; margin:0.5rem 0 1rem;">
   <li><strong>CO₂/token bar chart:</strong> Bars show the <strong>token-weighted</strong>
@@ -299,13 +302,16 @@ Ratio: 5,492 / 783 = 7.0× — nimbus uses 7× less energy for the same tokens.<
   show the current 5-minute rate.
   Bar color ranges from <span style="color:#22c55e">green</span> (low carbon per token) to
   <span style="color:#ef4444">red</span> (high) — reflecting both energy efficiency and
-  grid carbon intensity at the model's location.</li>
-  <li><strong>Model card "N× less energy" metric:</strong> Each model card shows how many
-  times more power the commercial frontier would require to serve the same tokens
-  (e.g. "7.0× less energy"). This is <code>frontier_watts / nrp_measured_watts</code>.</li>
-  <li><strong>Power comparison bar (per card):</strong> A horizontal bar comparing nimbus
-  measured watts (green) against the frontier equivalent (purple band), with a breakdown
-  of idle floor vs. marginal power.</li>
+  grid carbon intensity at the model's location. (Unlike the two comparisons below, this
+  bar always renders — it's an absolute CO₂/token measurement, not a frontier comparison.)</li>
+  <li><strong>Model card "N× less energy" metric:</strong> Shown only while actively
+  generating. Each model card shows how many times more power the commercial frontier
+  would require to serve the same tokens (e.g. "7.0× less energy"). This is
+  <code>frontier_watts / nimbus_measured_watts</code>. There is no color judgment on this
+  number — it's informational, not a verdict.</li>
+  <li><strong>Power comparison bar (per card):</strong> Shown only while actively
+  generating. A horizontal bar comparing nimbus measured watts against the frontier
+  equivalent (purple band), with a breakdown of idle floor vs. marginal power.</li>
 </ul>
 
 <h3>Energy efficiency across models (J/token view)</h3>
