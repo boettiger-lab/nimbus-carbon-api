@@ -431,7 +431,8 @@ function render(data) {
           </div>
           <div class="token-cmp-ratio">${ratioText}</div>
         </div>`;
-      frontierMetric = `<div class="metric"><div class="metric-label">vs. ${FRONTIER.label}</div><div class="metric-value">${fmt(fw/nrpW,1)}×</div><div class="metric-unit">less energy · ${windowLabel}</div></div>`;
+      const frontierUnitText = ratio >= 1.05 ? 'less energy' : ratio < 0.95 ? 'more energy' : 'same energy';
+      frontierMetric = `<div class="metric"><div class="metric-label">vs. ${FRONTIER.label}</div><div class="metric-value">${fmt(fw/nrpW,1)}×</div><div class="metric-unit">${frontierUnitText} · ${windowLabel}</div></div>`;
     }
 
     return `
