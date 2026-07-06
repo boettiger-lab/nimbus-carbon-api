@@ -87,14 +87,16 @@
   Token throughput is read from vLLM's built-in Prometheus metrics. Two counters are
   tracked separately and summed into a total token rate:
 </p>
-<pre><code>-- Output (decode) tokens generated per second:
-sum by (namespace, container, model_name) (
-  rate(vllm:generation_tokens_total[5m])
+<pre><code>-- Output (decode) tokens generated per second (2-minute window --
+-- short enough to track nimbus's bursty single-user traffic without
+-- diluting a burst across mostly-idle time on either side of it):
+sum by (namespace, model_name) (
+  rate(vllm:generation_tokens_total{namespace="default"}[2m])
 )
 
 -- Input (prefill) tokens processed per second:
-sum by (namespace, container, model_name) (
-  rate(vllm:prompt_tokens_total[5m])
+sum by (namespace, model_name) (
+  rate(vllm:prompt_tokens_total{namespace="default"}[2m])
 )</code></pre>
 <p>
   Both phases consume GPU energy: the <strong>prefill</strong> phase runs attention over

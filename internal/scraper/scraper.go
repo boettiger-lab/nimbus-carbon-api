@@ -464,18 +464,26 @@ func (s *Scraper) queryPower() (map[string]float64, error) {
 	return power, nil
 }
 
-// queryTokens returns 5-minute prompt and generation token rates keyed by
+// queryTokens returns 2-minute prompt and generation token rates keyed by
 // namespace, plus the vLLM model_name label for whichever model is
 // currently reporting traffic.
 func (s *Scraper) queryTokens() (genTokens, promptTokens map[string]float64, names map[string]string, err error) {
+	// [2m], not [5m]: nimbus's traffic is bursty single-user generation, not
+	// steady multi-tenant load. A 5-minute window dilutes a 20-second burst
+	// across 280 seconds of surrounding idle time and goes fully stale within
+	// minutes of the burst ending. [2m] is still >=4x the 30s scrape interval
+	// (Prometheus's own recommended minimum for a stable rate() over a
+	// counter) while tracking real bursts far more closely. Confirmed live:
+	// a real burst measured via raw counter deltas ran 30-133 tok/s, while
+	// rate(...[5m]) read 0-5 tok/s during and shortly after it.
 	genResults, err := s.client.Query(
-		`sum by (namespace, model_name) (rate(vllm:generation_tokens_total{namespace="default"}[5m]))`,
+		`sum by (namespace, model_name) (rate(vllm:generation_tokens_total{namespace="default"}[2m]))`,
 	)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	promptResults, err := s.client.Query(
-		`sum by (namespace, model_name) (rate(vllm:prompt_tokens_total{namespace="default"}[5m]))`,
+		`sum by (namespace, model_name) (rate(vllm:prompt_tokens_total{namespace="default"}[2m]))`,
 	)
 	if err != nil {
 		return nil, nil, nil, err
