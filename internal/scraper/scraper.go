@@ -1,6 +1,7 @@
 package scraper
 
 import (
+	"fmt"
 	"log"
 	"math"
 	"sync"
@@ -10,20 +11,41 @@ import (
 	"github.com/boettiger-lab/nimbus-carbon-api/internal/prom"
 )
 
-// nimbus is a single node with exactly one physical GPU (a GB10) and one
-// serving container ("vllm", shared by every model deployment — see
-// boettiger-lab/k8s/vllm/nimbus/deploy-*.yaml). These are fixed facts, not
-// queried, unlike nrp-carbon-api which discovers GPU count/hardware and
-// container name per pod across many nodes.
-const (
-	nimbusNamespace   = "default"
-	nimbusGPUCount    = 1
-	nimbusGPUHardware = "NVIDIA GB10"
-	nimbusContainer   = "vllm"
-)
+// Config parameterizes the scraper for a specific node. Defaults reproduce
+// the original nimbus behavior exactly (single GB10 in the "default"
+// namespace, per-namespace power attribution), so the same image serves both
+// nimbus and other nodes purely via environment overrides.
+//
+//   - nimbus: one GB10, one vllm pod in "default", DCGM power is already
+//     attributed to that pod's namespace by the pod-resources mapping, so
+//     power is queried per-namespace (NodePower=false).
+//   - cirrus: two RTX 8000s time-sliced across several namespaces
+//     (vllm/jupyter/mcp), so DCGM per-GPU power can't be split per tenant.
+//     Set NodePower=true to attribute TOTAL node GPU power (both cards) to the
+//     vLLM namespace — a deliberate upper bound, documented on the dashboard.
+type Config struct {
+	Namespace   string // vLLM namespace to read token/request metrics from
+	NodeName    string // node display name + DCGM Hostname selector for node-scope power
+	GPUHardware string // display string for the GPU model
+	GPUCount    int    // number of physical GPUs on the node
+	Container   string // serving container name (display only)
+	NodePower   bool   // true => attribute total node GPU power to Namespace (shared-GPU node)
+}
+
+// DefaultConfig returns the original nimbus configuration.
+func DefaultConfig() Config {
+	return Config{
+		Namespace:   "default",
+		NodeName:    "nimbus",
+		GPUHardware: "NVIDIA GB10",
+		GPUCount:    1,
+		Container:   "vllm",
+		NodePower:   false,
+	}
+}
 
 // ModelMetrics holds the latest carbon and performance metrics for the
-// currently-active model on nimbus.
+// currently-active model.
 type ModelMetrics struct {
 	// Identity
 	ModelName   string `json:"model_name"`
@@ -51,10 +73,7 @@ type ModelMetrics struct {
 	PromptTokensPerSecAvg24h     float64 `json:"prompt_tokens_per_sec_avg_24h,omitempty"`
 	GenerationTokensPerSecAvg24h float64 `json:"generation_tokens_per_sec_avg_24h,omitempty"`
 
-	// Live engine activity, read directly from vLLM/DCGM — always shown, even
-	// at zero, because these are absolute engine-state readings (queue depth,
-	// cache pressure, utilization), not comparisons that only mean something
-	// relative to other models.
+	// Live engine activity, read directly from vLLM/DCGM.
 	NumRequestsRunning float64 `json:"num_requests_running"`
 	NumRequestsWaiting float64 `json:"num_requests_waiting"`
 	KVCacheUsagePerc   float64 `json:"kv_cache_usage_percent"`
@@ -63,9 +82,13 @@ type ModelMetrics struct {
 
 	// MTPAcceptancePerc is the speculative-decoding (MTP) draft-token
 	// acceptance rate. Omitted entirely (not zero) for models that don't run
-	// speculative decoding — vLLM simply doesn't export the underlying
-	// spec_decode_* series for them.
+	// speculative decoding.
 	MTPAcceptancePerc float64 `json:"mtp_acceptance_percent,omitempty"`
+
+	// PowerIsNodeTotal flags that PowerWatts (and derived CO2) is the whole
+	// node's GPU power, not this model's isolated draw — true on shared,
+	// time-sliced GPU nodes where per-tenant power can't be measured.
+	PowerIsNodeTotal bool `json:"power_is_node_total,omitempty"`
 
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -89,8 +112,8 @@ type avgBucket struct {
 	SampleCount  int
 }
 
-const maxBuckets = 168    // 7 days of hourly buckets
-const maxHistory = 20160  // 7 days at 30s scrape intervals (for Series endpoint ring buffers)
+const maxBuckets = 168   // 7 days of hourly buckets
+const maxHistory = 20160 // 7 days at 30s scrape intervals (for Series endpoint ring buffers)
 
 type modelHistory struct {
 	PowerWatts      []dataPoint
@@ -152,21 +175,28 @@ func (h *modelHistory) addSample(t time.Time, power, promptTok, genTok, intensit
 	}
 }
 
-// Scraper polls Prometheus and maintains in-memory state. Keyed by
-// namespace alone (always "default" on nimbus) — see package comment.
+// Scraper polls Prometheus and maintains in-memory state, keyed by namespace.
 type Scraper struct {
 	client   *prom.Client
 	interval time.Duration
+	cfg      Config
 
 	mu      sync.RWMutex
 	models  map[string]*ModelMetrics
 	history map[string]*modelHistory
 }
 
+// New builds a scraper with the default (nimbus) configuration.
 func New(promURL string, interval time.Duration) *Scraper {
+	return NewWithConfig(promURL, interval, DefaultConfig())
+}
+
+// NewWithConfig builds a scraper for an arbitrary node.
+func NewWithConfig(promURL string, interval time.Duration, cfg Config) *Scraper {
 	return &Scraper{
 		client:   prom.NewClient(promURL, 30*time.Second),
 		interval: interval,
+		cfg:      cfg,
 		models:   make(map[string]*ModelMetrics),
 		history:  make(map[string]*modelHistory),
 	}
@@ -182,25 +212,57 @@ func (s *Scraper) Run() {
 	}
 }
 
+// powerKey maps a power series' namespace label to the key used for state.
+// In node-power mode every watt is attributed to the configured vLLM
+// namespace (the DCGM series has no meaningful/consistent namespace on a
+// time-sliced GPU), so the power and token histories share one key.
+func (s *Scraper) powerKey(ns string) string {
+	if s.cfg.NodePower {
+		return s.cfg.Namespace
+	}
+	return ns
+}
+
+// --- query builders (selectors depend on Config) ---
+
+func (s *Scraper) powerInstantQuery() string {
+	if s.cfg.NodePower {
+		return fmt.Sprintf(`sum (avg_over_time(DCGM_FI_DEV_POWER_USAGE{Hostname=%q}[5m]))`, s.cfg.NodeName)
+	}
+	return fmt.Sprintf(`sum by (namespace) (avg_over_time(DCGM_FI_DEV_POWER_USAGE{namespace=%q}[5m]))`, s.cfg.Namespace)
+}
+
+func (s *Scraper) powerRangeQuery() string {
+	if s.cfg.NodePower {
+		return fmt.Sprintf(`sum (DCGM_FI_DEV_POWER_USAGE{Hostname=%q})`, s.cfg.NodeName)
+	}
+	return fmt.Sprintf(`sum by (namespace) (DCGM_FI_DEV_POWER_USAGE{namespace=%q})`, s.cfg.Namespace)
+}
+
+func (s *Scraper) utilQuery() string {
+	if s.cfg.NodePower {
+		return fmt.Sprintf(`avg (avg_over_time(DCGM_FI_DEV_GPU_UTIL{Hostname=%q}[5m]))`, s.cfg.NodeName)
+	}
+	return fmt.Sprintf(`avg by (namespace) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{namespace=%q}[5m]))`, s.cfg.Namespace)
+}
+
 // backfill queries Prometheus for 7 days of historical power and token data
-// and seeds the hourly average buckets so that 24h/7d averages are
-// immediately correct after a restart, rather than starting from zero.
+// and seeds the hourly average buckets so 24h/7d averages are immediately
+// correct after a restart.
 func (s *Scraper) backfill() {
 	log.Println("scraper: backfilling 7-day averages from Prometheus...")
 	end := time.Now()
 	start := end.Add(-7 * 24 * time.Hour)
 	step := 5 * time.Minute
+	ns := s.cfg.Namespace
 
-	powerSeries, err := s.client.RangeQuery(
-		`sum by (namespace) (DCGM_FI_DEV_POWER_USAGE{namespace="default"})`,
-		start, end, step,
-	)
+	powerSeries, err := s.client.RangeQuery(s.powerRangeQuery(), start, end, step)
 	if err != nil {
 		log.Printf("scraper: backfill power query failed: %v", err)
 		return
 	}
 	promptSeries, err := s.client.RangeQuery(
-		`sum by (namespace) (rate(vllm:prompt_tokens_total{namespace="default"}[5m]))`,
+		fmt.Sprintf(`sum by (namespace) (rate(vllm:prompt_tokens_total{namespace=%q}[5m]))`, ns),
 		start, end, step,
 	)
 	if err != nil {
@@ -208,7 +270,7 @@ func (s *Scraper) backfill() {
 		return
 	}
 	genSeries, err := s.client.RangeQuery(
-		`sum by (namespace) (rate(vllm:generation_tokens_total{namespace="default"}[5m]))`,
+		fmt.Sprintf(`sum by (namespace) (rate(vllm:generation_tokens_total{namespace=%q}[5m]))`, ns),
 		start, end, step,
 	)
 	if err != nil {
@@ -218,44 +280,41 @@ func (s *Scraper) backfill() {
 
 	type sample struct{ power, promptTok, genTok float64 }
 	byKeyTime := make(map[string]map[int64]*sample)
-
-	for _, sr := range powerSeries {
-		key := sr.Metric["namespace"]
+	ensure := func(key string) map[int64]*sample {
 		if byKeyTime[key] == nil {
 			byKeyTime[key] = make(map[int64]*sample)
 		}
+		return byKeyTime[key]
+	}
+
+	for _, sr := range powerSeries {
+		m := ensure(s.powerKey(sr.Metric["namespace"]))
 		for _, pt := range sr.Points {
 			ts := pt.Time.Unix()
-			if byKeyTime[key][ts] == nil {
-				byKeyTime[key][ts] = &sample{}
+			if m[ts] == nil {
+				m[ts] = &sample{}
 			}
-			byKeyTime[key][ts].power += pt.Value
+			m[ts].power += pt.Value
 		}
 	}
 	for _, sr := range promptSeries {
-		key := sr.Metric["namespace"]
-		if byKeyTime[key] == nil {
-			byKeyTime[key] = make(map[int64]*sample)
-		}
+		m := ensure(sr.Metric["namespace"])
 		for _, pt := range sr.Points {
 			ts := pt.Time.Unix()
-			if byKeyTime[key][ts] == nil {
-				byKeyTime[key][ts] = &sample{}
+			if m[ts] == nil {
+				m[ts] = &sample{}
 			}
-			byKeyTime[key][ts].promptTok += pt.Value
+			m[ts].promptTok += pt.Value
 		}
 	}
 	for _, sr := range genSeries {
-		key := sr.Metric["namespace"]
-		if byKeyTime[key] == nil {
-			byKeyTime[key] = make(map[int64]*sample)
-		}
+		m := ensure(sr.Metric["namespace"])
 		for _, pt := range sr.Points {
 			ts := pt.Time.Unix()
-			if byKeyTime[key][ts] == nil {
-				byKeyTime[key][ts] = &sample{}
+			if m[ts] == nil {
+				m[ts] = &sample{}
 			}
-			byKeyTime[key][ts].genTok += pt.Value
+			m[ts].genTok += pt.Value
 		}
 	}
 
@@ -290,11 +349,10 @@ func (s *Scraper) Models() []*ModelMetrics {
 	return out
 }
 
-// Series returns the history for a namespace/metric combination.
-// container is accepted for API-compatibility with the
-// /api/v1/carbon/{ns}/{container}/{metric} route but is otherwise unused —
-// nimbus has exactly one container ("vllm") per namespace, always.
-// metric is one of "power_watts", "co2_grams_per_hour", "co2_mg_per_token".
+// Series returns the history for a namespace/metric combination. container is
+// accepted for API-compatibility with the route but is unused (one container
+// per namespace). metric is one of "power_watts", "co2_grams_per_hour",
+// "co2_mg_per_token".
 func (s *Scraper) Series(namespace, container, metric string, since time.Duration) [][2]interface{} {
 	_ = container
 	s.mu.RLock()
@@ -392,10 +450,10 @@ func (s *Scraper) scrape() {
 		m := &ModelMetrics{
 			ModelName:              modelName,
 			Namespace:              key,
-			Container:              nimbusContainer,
-			GPUHardware:            nimbusGPUHardware,
-			Node:                   "nimbus",
-			GPUCount:               nimbusGPUCount,
+			Container:              s.cfg.Container,
+			GPUHardware:            s.cfg.GPUHardware,
+			Node:                   s.cfg.NodeName,
+			GPUCount:               s.cfg.GPUCount,
 			PowerWatts:             math.Round(power*10) / 10,
 			PromptTokensPerSec:     math.Round(promptTok*10) / 10,
 			GenerationTokensPerSec: math.Round(genTok*10) / 10,
@@ -407,6 +465,7 @@ func (s *Scraper) scrape() {
 			KVCacheUsagePerc:       math.Round(kvCacheByKey[key]*10) / 10,
 			GPUUtilPerc:            math.Round(gpuUtilByKey[key]*10) / 10,
 			RequestsPerHour:        math.Round(requestRateByKey[key]*10) / 10,
+			PowerIsNodeTotal:       s.cfg.NodePower,
 			UpdatedAt:              now,
 		}
 		if co2PerToken > 0 {
@@ -432,9 +491,6 @@ func (s *Scraper) scrape() {
 			m.CO2MgPerTokenAvg7d = co2Avg7d
 		}
 		if powerAvg24h != 0 {
-			// powerAvg24h is 0 only when no samples fell in the 24h window
-			// (addSample never records a sample with power <= 0), so this
-			// single check gates all three time-weighted means together.
 			m.PowerWattsAvg24h = powerAvg24h
 			m.PromptTokensPerSecAvg24h = promptAvg24h
 			m.GenerationTokensPerSecAvg24h = genAvg24h
@@ -442,21 +498,9 @@ func (s *Scraper) scrape() {
 	}
 }
 
-// average24h7d computes the 24h/7d token-weighted CO₂/token means (from
-// active samples only) and the 24h time-weighted power/prompt/gen-token
-// means (from every reporting sample), given the current time and a
-// model's accumulated hourly buckets.
-//
-// avgBucket.PowerSum/PromptTokSum/GenTokSum are sums over every individual
-// sample within that hour (accumulated by addSample), so the 24h means must
-// divide by the total number of samples across the touched buckets
-// (SampleCount), not by the number of buckets touched -- otherwise the
-// result scales with samples-per-hour instead of being a true per-sample
-// mean.
-//
-// Each return value is 0 when it could not be computed (no data in the
-// relevant window), matching how the corresponding ModelMetrics fields are
-// already zero-valued with `omitempty` JSON tags when not computed.
+// average24h7d computes the 24h/7d token-weighted CO₂/token means (active
+// samples only) and the 24h time-weighted power/prompt/gen-token means (every
+// reporting sample). Each return value is 0 when it could not be computed.
 func average24h7d(now time.Time, buckets []avgBucket) (co2Avg24h, co2Avg7d, powerAvg24h, promptAvg24h, genAvg24h float64) {
 	var wSum24, tSum24, wSum7d, tSum7d float64
 	var powSum24, promptSum24, genSum24 float64
@@ -492,42 +536,32 @@ func average24h7d(now time.Time, buckets []avgBucket) (co2Avg24h, co2Avg7d, powe
 	return
 }
 
-// queryPower returns total GPU power (W) keyed by namespace.
+// queryPower returns GPU power (W) keyed by namespace (or, in node-power mode,
+// total node power under the configured namespace key).
 func (s *Scraper) queryPower() (map[string]float64, error) {
-	results, err := s.client.Query(
-		`sum by (namespace) (avg_over_time(DCGM_FI_DEV_POWER_USAGE{namespace="default"}[5m]))`,
-	)
+	results, err := s.client.Query(s.powerInstantQuery())
 	if err != nil {
 		return nil, err
 	}
-
 	power := make(map[string]float64)
 	for _, r := range results {
-		power[r.Metric["namespace"]] += r.Value
+		power[s.powerKey(r.Metric["namespace"])] += r.Value
 	}
 	return power, nil
 }
 
 // queryTokens returns 2-minute prompt and generation token rates keyed by
-// namespace, plus the vLLM model_name label for whichever model is
-// currently reporting traffic.
+// namespace, plus the vLLM model_name label.
 func (s *Scraper) queryTokens() (genTokens, promptTokens map[string]float64, names map[string]string, err error) {
-	// [2m], not [5m]: nimbus's traffic is bursty single-user generation, not
-	// steady multi-tenant load. A 5-minute window dilutes a 20-second burst
-	// across 280 seconds of surrounding idle time and goes fully stale within
-	// minutes of the burst ending. [2m] is still >=4x the 30s scrape interval
-	// (Prometheus's own recommended minimum for a stable rate() over a
-	// counter) while tracking real bursts far more closely. Confirmed live:
-	// a real burst measured via raw counter deltas ran 30-133 tok/s, while
-	// rate(...[5m]) read 0-5 tok/s during and shortly after it.
+	ns := s.cfg.Namespace
 	genResults, err := s.client.Query(
-		`sum by (namespace, model_name) (rate(vllm:generation_tokens_total{namespace="default"}[2m]))`,
+		fmt.Sprintf(`sum by (namespace, model_name) (rate(vllm:generation_tokens_total{namespace=%q}[2m]))`, ns),
 	)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	promptResults, err := s.client.Query(
-		`sum by (namespace, model_name) (rate(vllm:prompt_tokens_total{namespace="default"}[2m]))`,
+		fmt.Sprintf(`sum by (namespace, model_name) (rate(vllm:prompt_tokens_total{namespace=%q}[2m]))`, ns),
 	)
 	if err != nil {
 		return nil, nil, nil, err
@@ -553,21 +587,18 @@ func (s *Scraper) queryTokens() (genTokens, promptTokens map[string]float64, nam
 	return genTokens, promptTokens, names, nil
 }
 
-// queryRequestStats returns vLLM's own live engine-state gauges keyed by
-// namespace: how many requests are actively running, how many are queued
-// behind them, and how full the KV cache is. These are absolute readings
-// straight from the engine, not rates or comparisons, so 0 is exactly as
-// meaningful as any other value.
+// queryRequestStats returns vLLM's live engine-state gauges keyed by namespace.
 func (s *Scraper) queryRequestStats() (running, waiting, kvCache map[string]float64, err error) {
-	runResults, err := s.client.Query(`sum by (namespace) (vllm:num_requests_running{namespace="default"})`)
+	ns := s.cfg.Namespace
+	runResults, err := s.client.Query(fmt.Sprintf(`sum by (namespace) (vllm:num_requests_running{namespace=%q})`, ns))
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	waitResults, err := s.client.Query(`sum by (namespace) (vllm:num_requests_waiting{namespace="default"})`)
+	waitResults, err := s.client.Query(fmt.Sprintf(`sum by (namespace) (vllm:num_requests_waiting{namespace=%q})`, ns))
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	kvResults, err := s.client.Query(`avg by (namespace) (vllm:kv_cache_usage_perc{namespace="default"}) * 100`)
+	kvResults, err := s.client.Query(fmt.Sprintf(`avg by (namespace) (vllm:kv_cache_usage_perc{namespace=%q}) * 100`, ns))
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -587,31 +618,24 @@ func (s *Scraper) queryRequestStats() (running, waiting, kvCache map[string]floa
 	return running, waiting, kvCache, nil
 }
 
-// queryGPUUtil returns average GPU compute utilization (%) keyed by
-// namespace, smoothed over the same 5-minute window as the power query.
-// DCGM already reports this 0-100, no scaling needed.
+// queryGPUUtil returns average GPU compute utilization (%), attributed to the
+// configured namespace key (node-wide in node-power mode).
 func (s *Scraper) queryGPUUtil() (map[string]float64, error) {
-	results, err := s.client.Query(
-		`avg by (namespace) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{namespace="default"}[5m]))`,
-	)
+	results, err := s.client.Query(s.utilQuery())
 	if err != nil {
 		return nil, err
 	}
 	util := make(map[string]float64)
 	for _, r := range results {
-		util[r.Metric["namespace"]] = r.Value
+		util[s.powerKey(r.Metric["namespace"])] = r.Value
 	}
 	return util, nil
 }
 
-// queryRequestRate returns completed requests per hour keyed by namespace —
-// vllm:request_success_total summed across every finished_reason (stop,
-// length, abort, error, repetition), over a 15-minute window. 15m rather
-// than the [2m] used for token rate: individual requests on nimbus are
-// infrequent enough that a short window mostly reads zero between them.
+// queryRequestRate returns completed requests per hour keyed by namespace.
 func (s *Scraper) queryRequestRate() (map[string]float64, error) {
 	results, err := s.client.Query(
-		`sum by (namespace) (rate(vllm:request_success_total{namespace="default"}[15m])) * 3600`,
+		fmt.Sprintf(`sum by (namespace) (rate(vllm:request_success_total{namespace=%q}[15m])) * 3600`, s.cfg.Namespace),
 	)
 	if err != nil {
 		return nil, err
@@ -624,15 +648,12 @@ func (s *Scraper) queryRequestRate() (map[string]float64, error) {
 }
 
 // queryMTPAcceptance returns the speculative-decoding (MTP) draft-token
-// acceptance rate (%) keyed by namespace, over the same 15-minute window as
-// the request rate. Models that don't run speculative decoding export no
-// spec_decode_* series at all, so the ratio's numerator/denominator series
-// simply don't exist and no key is produced for that namespace — the client
-// already drops the resulting NaN rather than reporting a false zero.
+// acceptance rate (%) keyed by namespace.
 func (s *Scraper) queryMTPAcceptance() (map[string]float64, error) {
+	ns := s.cfg.Namespace
 	results, err := s.client.Query(
-		`100 * sum by (namespace) (rate(vllm:spec_decode_num_accepted_tokens_total{namespace="default"}[15m]))
-			/ sum by (namespace) (rate(vllm:spec_decode_num_draft_tokens_total{namespace="default"}[15m]))`,
+		fmt.Sprintf(`100 * sum by (namespace) (rate(vllm:spec_decode_num_accepted_tokens_total{namespace=%q}[15m]))
+			/ sum by (namespace) (rate(vllm:spec_decode_num_draft_tokens_total{namespace=%q}[15m]))`, ns, ns),
 	)
 	if err != nil {
 		return nil, err
@@ -657,16 +678,14 @@ type ClusterTimePoint struct {
 func (s *Scraper) ClusterTimeSeries(rangeBack, step time.Duration) ([]ClusterTimePoint, error) {
 	end := time.Now()
 	start := end.Add(-rangeBack)
+	ns := s.cfg.Namespace
 
-	powerSeries, err := s.client.RangeQuery(
-		`sum by (namespace) (DCGM_FI_DEV_POWER_USAGE{namespace="default"})`,
-		start, end, step,
-	)
+	powerSeries, err := s.client.RangeQuery(s.powerRangeQuery(), start, end, step)
 	if err != nil {
 		return nil, err
 	}
 	tokenSeries, err := s.client.RangeQuery(
-		`sum by (namespace) (rate(vllm:generation_tokens_total{namespace="default"}[5m]) + rate(vllm:prompt_tokens_total{namespace="default"}[5m]))`,
+		fmt.Sprintf(`sum by (namespace) (rate(vllm:generation_tokens_total{namespace=%q}[5m]) + rate(vllm:prompt_tokens_total{namespace=%q}[5m]))`, ns, ns),
 		start, end, step,
 	)
 	if err != nil {

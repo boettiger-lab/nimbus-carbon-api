@@ -26,8 +26,22 @@ func main() {
 	interval := getenvDuration("SCRAPE_INTERVAL", 30*time.Second)
 	addr := getenv("LISTEN_ADDR", ":8080")
 
-	s = scraper.New(promURL, interval)
+	// Node config, env-overridable. Defaults reproduce the original nimbus
+	// behavior so this same image serves nimbus unchanged; cirrus (shared,
+	// time-sliced 2x RTX 8000) overrides NAMESPACE/NODE_NAME/GPU_* and sets
+	// NODE_POWER=true to attribute total node GPU power to the vLLM namespace.
+	cfg := scraper.DefaultConfig()
+	cfg.Namespace = getenv("NAMESPACE", cfg.Namespace)
+	cfg.NodeName = getenv("NODE_NAME", cfg.NodeName)
+	cfg.GPUHardware = getenv("GPU_HARDWARE", cfg.GPUHardware)
+	cfg.Container = getenv("CONTAINER", cfg.Container)
+	cfg.GPUCount = getenvInt("GPU_COUNT", cfg.GPUCount)
+	cfg.NodePower = getenvBool("NODE_POWER", cfg.NodePower)
+
+	s = scraper.NewWithConfig(promURL, interval, cfg)
 	go s.Run()
+	log.Printf("carbon-api config: node=%s ns=%s gpu=%q count=%d node_power=%v",
+		cfg.NodeName, cfg.Namespace, cfg.GPUHardware, cfg.GPUCount, cfg.NodePower)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleDashboard)
@@ -151,6 +165,25 @@ func handleSeries(w http.ResponseWriter, r *http.Request) {
 func getenv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func getenvInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func getenvBool(key string, def bool) bool {
+	switch strings.ToLower(os.Getenv(key)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
 	}
 	return def
 }
