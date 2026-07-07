@@ -51,6 +51,22 @@ type ModelMetrics struct {
 	PromptTokensPerSecAvg24h     float64 `json:"prompt_tokens_per_sec_avg_24h,omitempty"`
 	GenerationTokensPerSecAvg24h float64 `json:"generation_tokens_per_sec_avg_24h,omitempty"`
 
+	// Live engine activity, read directly from vLLM/DCGM — always shown, even
+	// at zero, because these are absolute engine-state readings (queue depth,
+	// cache pressure, utilization), not comparisons that only mean something
+	// relative to other models.
+	NumRequestsRunning float64 `json:"num_requests_running"`
+	NumRequestsWaiting float64 `json:"num_requests_waiting"`
+	KVCacheUsagePerc   float64 `json:"kv_cache_usage_percent"`
+	GPUUtilPerc        float64 `json:"gpu_util_percent"`
+	RequestsPerHour    float64 `json:"requests_per_hour"`
+
+	// MTPAcceptancePerc is the speculative-decoding (MTP) draft-token
+	// acceptance rate. Omitted entirely (not zero) for models that don't run
+	// speculative decoding — vLLM simply doesn't export the underlying
+	// spec_decode_* series for them.
+	MTPAcceptancePerc float64 `json:"mtp_acceptance_percent,omitempty"`
+
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
@@ -323,6 +339,26 @@ func (s *Scraper) scrape() {
 		log.Printf("scraper: token query failed: %v", err)
 	}
 
+	runningByKey, waitingByKey, kvCacheByKey, err := s.queryRequestStats()
+	if err != nil {
+		log.Printf("scraper: request stats query failed: %v", err)
+	}
+
+	gpuUtilByKey, err := s.queryGPUUtil()
+	if err != nil {
+		log.Printf("scraper: GPU util query failed: %v", err)
+	}
+
+	requestRateByKey, err := s.queryRequestRate()
+	if err != nil {
+		log.Printf("scraper: request rate query failed: %v", err)
+	}
+
+	mtpAcceptanceByKey, err := s.queryMTPAcceptance()
+	if err != nil {
+		log.Printf("scraper: MTP acceptance query failed: %v", err)
+	}
+
 	keys := make(map[string]struct{})
 	for k := range powerByKey {
 		keys[k] = struct{}{}
@@ -366,10 +402,18 @@ func (s *Scraper) scrape() {
 			TokensPerSec:           math.Round(totalTok*10) / 10,
 			CarbonIntensity:        intensity,
 			CO2GramsPerHour:        math.Round(co2PerHour*10) / 10,
+			NumRequestsRunning:     runningByKey[key],
+			NumRequestsWaiting:     waitingByKey[key],
+			KVCacheUsagePerc:       math.Round(kvCacheByKey[key]*10) / 10,
+			GPUUtilPerc:            math.Round(gpuUtilByKey[key]*10) / 10,
+			RequestsPerHour:        math.Round(requestRateByKey[key]*10) / 10,
 			UpdatedAt:              now,
 		}
 		if co2PerToken > 0 {
 			m.CO2MgPerToken = math.Round(co2PerToken*1000) / 1000
+		}
+		if mtp, ok := mtpAcceptanceByKey[key]; ok {
+			m.MTPAcceptancePerc = math.Round(mtp*10) / 10
 		}
 
 		s.models[key] = m
@@ -507,6 +551,97 @@ func (s *Scraper) queryTokens() (genTokens, promptTokens map[string]float64, nam
 		}
 	}
 	return genTokens, promptTokens, names, nil
+}
+
+// queryRequestStats returns vLLM's own live engine-state gauges keyed by
+// namespace: how many requests are actively running, how many are queued
+// behind them, and how full the KV cache is. These are absolute readings
+// straight from the engine, not rates or comparisons, so 0 is exactly as
+// meaningful as any other value.
+func (s *Scraper) queryRequestStats() (running, waiting, kvCache map[string]float64, err error) {
+	runResults, err := s.client.Query(`sum by (namespace) (vllm:num_requests_running{namespace="default"})`)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	waitResults, err := s.client.Query(`sum by (namespace) (vllm:num_requests_waiting{namespace="default"})`)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	kvResults, err := s.client.Query(`avg by (namespace) (vllm:kv_cache_usage_perc{namespace="default"}) * 100`)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	running = make(map[string]float64)
+	waiting = make(map[string]float64)
+	kvCache = make(map[string]float64)
+	for _, r := range runResults {
+		running[r.Metric["namespace"]] = r.Value
+	}
+	for _, r := range waitResults {
+		waiting[r.Metric["namespace"]] = r.Value
+	}
+	for _, r := range kvResults {
+		kvCache[r.Metric["namespace"]] = r.Value
+	}
+	return running, waiting, kvCache, nil
+}
+
+// queryGPUUtil returns average GPU compute utilization (%) keyed by
+// namespace, smoothed over the same 5-minute window as the power query.
+// DCGM already reports this 0-100, no scaling needed.
+func (s *Scraper) queryGPUUtil() (map[string]float64, error) {
+	results, err := s.client.Query(
+		`avg by (namespace) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{namespace="default"}[5m]))`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	util := make(map[string]float64)
+	for _, r := range results {
+		util[r.Metric["namespace"]] = r.Value
+	}
+	return util, nil
+}
+
+// queryRequestRate returns completed requests per hour keyed by namespace —
+// vllm:request_success_total summed across every finished_reason (stop,
+// length, abort, error, repetition), over a 15-minute window. 15m rather
+// than the [2m] used for token rate: individual requests on nimbus are
+// infrequent enough that a short window mostly reads zero between them.
+func (s *Scraper) queryRequestRate() (map[string]float64, error) {
+	results, err := s.client.Query(
+		`sum by (namespace) (rate(vllm:request_success_total{namespace="default"}[15m])) * 3600`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	rate := make(map[string]float64)
+	for _, r := range results {
+		rate[r.Metric["namespace"]] = r.Value
+	}
+	return rate, nil
+}
+
+// queryMTPAcceptance returns the speculative-decoding (MTP) draft-token
+// acceptance rate (%) keyed by namespace, over the same 15-minute window as
+// the request rate. Models that don't run speculative decoding export no
+// spec_decode_* series at all, so the ratio's numerator/denominator series
+// simply don't exist and no key is produced for that namespace — the client
+// already drops the resulting NaN rather than reporting a false zero.
+func (s *Scraper) queryMTPAcceptance() (map[string]float64, error) {
+	results, err := s.client.Query(
+		`100 * sum by (namespace) (rate(vllm:spec_decode_num_accepted_tokens_total{namespace="default"}[15m]))
+			/ sum by (namespace) (rate(vllm:spec_decode_num_draft_tokens_total{namespace="default"}[15m]))`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	rate := make(map[string]float64)
+	for _, r := range results {
+		rate[r.Metric["namespace"]] = r.Value
+	}
+	return rate, nil
 }
 
 // ClusterTimePoint is one time-step of aggregated cluster-wide carbon data.

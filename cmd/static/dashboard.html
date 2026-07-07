@@ -95,6 +95,11 @@
   .token-cmp-legend{display:flex;justify-content:space-between;margin-top:.35rem;font-size:.65rem;color:var(--muted);}
   .token-cmp-ratio{font-size:.72rem;margin-top:.3rem;font-weight:600;color:var(--text);}
 
+  /* Live engine activity (running/waiting requests, KV cache, GPU util) */
+  .activity{margin-top:.65rem;padding-top:.65rem;border-top:1px solid var(--border);}
+  .activity-header{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:.45rem;}
+  .activity-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(85px,1fr));gap:.5rem;}
+
   footer{text-align:center;padding:2rem;font-size:.71rem;color:var(--muted);}
   footer a{color:var(--muted);}
 
@@ -369,6 +374,17 @@ function render(data) {
         ${frontierMetric}
       </div>
       ${wattsCmp}
+      <div class="activity">
+        <div class="activity-header">Live Activity</div>
+        <div class="activity-grid">
+          <div class="metric"><div class="metric-label">Running</div><div class="metric-value">${fmt(m.num_requests_running,0)}</div><div class="metric-unit">requests</div></div>
+          <div class="metric"><div class="metric-label">Queued</div><div class="metric-value">${fmt(m.num_requests_waiting,0)}</div><div class="metric-unit">requests</div></div>
+          <div class="metric"><div class="metric-label">KV Cache</div><div class="metric-value">${fmt(m.kv_cache_usage_percent)}</div><div class="metric-unit">percent</div></div>
+          <div class="metric"><div class="metric-label">GPU Util</div><div class="metric-value">${fmt(m.gpu_util_percent)}</div><div class="metric-unit">percent</div></div>
+          <div class="metric"><div class="metric-label">Requests</div><div class="metric-value">${fmt(m.requests_per_hour)}</div><div class="metric-unit">per hour</div></div>
+          ${m.mtp_acceptance_percent!=null ? `<div class="metric"><div class="metric-label">MTP Accept</div><div class="metric-value">${fmt(m.mtp_acceptance_percent)}</div><div class="metric-unit">percent</div></div>` : ''}
+        </div>
+      </div>
       <div class="grid-intensity">
         <div class="grid-intensity-header">
           <span class="grid-location">${locationLabel(m.node)}</span>
