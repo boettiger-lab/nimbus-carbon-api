@@ -133,7 +133,7 @@ sum by (namespace, model_name) (
 
 <h3>Token-weighted averaging</h3>
 <p>
-  The 24-hour and 7-day CO₂/token averages shown in the bar chart use a
+  The 24-hour and 7-day CO₂/token averages shown on each model card use a
   <strong>token-weighted mean</strong> rather than an unweighted arithmetic mean.
   Because CO₂/token is a ratio (power ÷ throughput), samples taken during low-throughput
   periods produce extreme values — a model drawing 2,000 W at 5 tok/s yields
@@ -252,8 +252,8 @@ ratio = frontier_watts / nrp_measured_watts</code></pre>
   This formula is applied to each nimbus model using its <strong>actual observed</strong>
   prompt and generation token rates. The comparison is shown as a plain-text watts bar on
   each model card, visible only while the model is actively generating (24h-avg combined
-  tok/s above a small threshold) — not as a colored verdict, and not on the CO₂/token bar
-  chart, which is a separate, unrelated, always-rendered absolute measurement.
+  tok/s above a small threshold) — not as a colored verdict, and separate from the
+  CO₂/token and J/token card tiles, which are always-rendered absolute measurements.
 </p>
 
 <h3>Example: nimbus at typical light traffic</h3>
@@ -300,17 +300,6 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
   expected behavior for this hardware, not something to judge either way:
 </p>
 <ul style="color:#cbd5e1; padding-left:1.5rem; margin:0.5rem 0 1rem;">
-  <li><strong>CO₂/token bar chart:</strong> Bars show the <strong>token-weighted</strong>
-  24-hour average CO₂ per token (mg) for each active nimbus model. Each 30-second sample is
-  weighted by its throughput (tok/s), so periods of high utilization contribute
-  proportionally more to the average than brief low-throughput transitions. This prevents
-  ramp-up/ramp-down periods (where CO₂/token is transiently extreme due to idle power
-  divided by few tokens) from dominating the long-run average. Green diamond (◆) markers
-  show the current 5-minute rate.
-  Bar color ranges from <span style="color:#22c55e">green</span> (low carbon per token) to
-  <span style="color:#ef4444">red</span> (high) — reflecting both energy efficiency and
-  grid carbon intensity at the model's location. (Unlike the two comparisons below, this
-  bar always renders — it's an absolute CO₂/token measurement, not a frontier comparison.)</li>
   <li><strong>Model card "N× less energy" metric:</strong> Shown only while actively
   generating. Each model card shows how many times more power the commercial frontier
   would require to serve the same tokens (e.g. "7.0× less energy"). This is
@@ -320,12 +309,23 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
   generating. A horizontal bar comparing nimbus measured watts against the frontier
   equivalent (purple band), with a breakdown of idle floor vs. marginal power.</li>
 </ul>
-
-<h3>Energy per token across models (J/token view)</h3>
 <p>
-  The bar chart can be toggled to show <strong>J/token</strong> (joules per token) —
-  a hardware- and grid-neutral measure of energy spent per token, computed from
-  24-hour averages (the same window the CO₂/token chart uses):
+  CO₂/token and J/token are both plain per-model card stats, not chart bars — a number
+  (with a 24h average alongside where available), or <code>—</code> when there isn't
+  enough throughput to make the ratio meaningful. Neither is colored by a comparative
+  scale: nimbus almost always runs exactly one active model at a time (it's a
+  single-GPU personal box, not a multi-tenant cluster), so any chart comparing bars
+  <em>against each other</em> would only ever have one bar — and coloring a lone bar by
+  its own maximum always renders it at the most "extreme" color, regardless of the
+  actual value. A comparison visualization's entire reason to exist is comparing
+  multiple things; with one thing, it can only produce a misleading result.
+</p>
+
+<h3>Energy per token (J/token)</h3>
+<p>
+  <strong>J/token</strong> (joules per token) is a hardware- and grid-neutral measure of
+  energy spent per token, computed from 24-hour averages (the same window CO₂/token
+  uses):
 </p>
 <pre><code>J_per_token = power_watts_avg_24h / (prompt_tokens_per_sec_avg_24h + generation_tokens_per_sec_avg_24h)</code></pre>
 <p>
@@ -348,11 +348,10 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
   MoE only activates ~60B parameters per token</li>
 </ul>
 <div class="callout">
-  <p><strong>Note:</strong> J/token only appears for models with combined 24h-avg
-  prompt+generation throughput above 0.1 tok/s. Bars are colored on a single-hue magnitude
-  scale (no green/red judgment) — lower is more energy per output, but is not itself
-  "better" or "worse" without knowing the workload. Tooltips show the underlying 24h-avg
-  watts, tok/s, and GPU hardware for context.</p>
+  <p><strong>Note:</strong> the J/token card tile only shows a value for models with
+  combined 24h-avg prompt+generation throughput above 0.1 tok/s (otherwise <code>—</code>).
+  There is no color judgment — lower is more energy per output, but is not itself
+  "better" or "worse" without knowing the workload.</p>
 </div>
 
 <h3>Cumulative CO₂ emissions (time-series view)</h3>
@@ -390,6 +389,9 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
     frameworks show 62–137× energy vs single-turn (arXiv:2506.04301); production systems
     are likely lower but remain poorly characterized in the literature</li>
   <li>The eGRID intensity table in <code>internal/carbon/intensity.go</code> will be updated as new annual data is published</li>
+  <li>History (24h/7d averages, and the cumulative emissions chart) is in-memory only and
+    resets on every pod restart, backfilled only from Prometheus's own ~2-day retention.
+    Persistent storage across restarts is a possible future improvement, not yet implemented</li>
 </ul>
 <p>
   For a more complete lifecycle analysis including training, hardware manufacturing, and

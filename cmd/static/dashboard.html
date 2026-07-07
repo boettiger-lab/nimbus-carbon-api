@@ -95,7 +95,6 @@
   .token-cmp-legend{display:flex;justify-content:space-between;margin-top:.35rem;font-size:.65rem;color:var(--muted);}
   .token-cmp-ratio{font-size:.72rem;margin-top:.3rem;font-weight:600;color:var(--text);}
 
-  .workload-note{font-size:.67rem;color:var(--muted);margin:.35rem 0 .7rem;padding:.4rem .75rem;background:rgba(99,102,241,.07);border:1px solid var(--border);border-left:2px solid var(--accent);border-radius:.4rem;}
   footer{text-align:center;padding:2rem;font-size:.71rem;color:var(--muted);}
   footer a{color:var(--muted);}
 
@@ -138,18 +137,6 @@
     <div class="ref-frames" id="ref-frames"></div>
   </div>
 
-  <div class="chart-wrap">
-    <div class="section-head">
-      <h2 id="bar-title">CO₂ per token by model</h2>
-      <div class="range-tabs" id="bar-mode-tabs">
-        <button class="range-tab active" data-mode="co2">CO₂ / token</button>
-        <button class="range-tab" data-mode="joules">J / token</button>
-      </div>
-    </div>
-    <div class="workload-note" id="bar-note">Green bars: nimbus measured CO₂/token. Green ◆: current 5-min rate. Red ✕: what a commercial frontier model (~1.5T MoE on 24× H100) would emit on the <em>same grid</em>. <a href="/methodology" style="color:var(--accent)">Methodology</a></div>
-    <canvas id="barChart"></canvas>
-  </div>
-
   <div class="section-head" style="margin-top:1.75rem">
     <h2>Models</h2>
   </div>
@@ -167,10 +154,8 @@
 <script>
 const API    = '/api/v1/carbon';
 const TS_API = '/api/v1/carbon/timeseries';
-let barChart  = null;
 let lineChart = null;
 let currentRange = '7d';
-let barMode = 'co2';
 let lastData = null;
 let lastEmissionsTotalGrams = 0;
 
@@ -185,7 +170,7 @@ function chartColors() {
 
 function applyChartTheme() {
   const c = chartColors();
-  [barChart, lineChart].forEach(ch => {
+  [lineChart].forEach(ch => {
     if (!ch) return;
     Object.values(ch.options.scales).forEach(s => {
       if (s.grid)  s.grid.color   = c.grid;
@@ -265,109 +250,6 @@ function co2Color(gph){ return gph<100?'green':gph<300?'yellow':gph<600?'orange'
 function fmt(n,d=1){ return (n==null||isNaN(n))?'—':n.toFixed(d); }
 function shortModel(name){ if(!name)return null; const p=name.split('/'); return p[p.length-1]; }
 
-const BAR_NOTES = {
-  co2: 'CO₂ per token (24h avg). Green ◆: current 5-min rate. Bar color: <span style="color:var(--green)">green</span> = low carbon per token, <span style="color:var(--red)">red</span> = high — reflects both energy efficiency and grid carbon intensity at the model\'s location. <a href="/methodology" style="color:var(--accent)">Methodology</a>',
-  joules: 'Energy per token (J/token = watts ÷ tokens/sec) over the trailing 24h, independent of grid location. Lower means more output per watt — but this reflects batch size and workload as much as GPU health: a personal single-user box naturally runs higher J/token than a heavily-batched datacenter server, and that is expected, not a problem. <a href="/methodology" style="color:var(--accent)">Methodology</a>',
-};
-const BAR_TITLES = { co2: 'CO₂ per token by model', joules: 'Energy efficiency by model (J/token)' };
-
-function renderBarChart(models) {
-  if (barChart) { barChart.destroy(); barChart = null; }
-  document.getElementById('bar-title').textContent = BAR_TITLES[barMode];
-  document.getElementById('bar-note').innerHTML = BAR_NOTES[barMode];
-
-  const cc0 = chartColors();
-
-  if (barMode === 'co2') {
-    const bm = models.filter(m => m.co2_mg_per_token_avg_24h > 0 || m.co2_mg_per_token > 0).slice().sort((a,b) => {
-      return (a.co2_mg_per_token_avg_24h || a.co2_mg_per_token || 0) - (b.co2_mg_per_token_avg_24h || b.co2_mg_per_token || 0);
-    });
-    const labels = bm.map(m => shortModel(m.model_name) || m.container);
-    const avg24h = bm.map(m => m.co2_mg_per_token_avg_24h || m.co2_mg_per_token || 0);
-    const current = bm.map(m => m.co2_mg_per_token || null);
-    const maxCo2 = Math.max(...avg24h, 0.001);
-    const co2Colors = avg24h.map(v => {
-      const t = Math.min(v / maxCo2, 1);
-      if (t < 0.25) return 'rgba(34,197,94,0.8)';
-      if (t < 0.50) return 'rgba(134,239,172,0.8)';
-      if (t < 0.75) return 'rgba(249,115,22,0.7)';
-      return 'rgba(239,68,68,0.7)';
-    });
-    barChart = new Chart(document.getElementById('barChart'), {
-      type: 'bar',
-      data: { labels, datasets: [
-        { label:'CO₂/token 24h avg (mg)', data:avg24h, backgroundColor:co2Colors, borderRadius:4, order:2 },
-        { label:'CO₂/token current (mg)', data:current, type:'scatter', pointStyle:'rectRot', pointRadius:7, backgroundColor:'rgba(34,197,94,0.9)', borderColor:'#fff', borderWidth:1, order:1 },
-      ]},
-      options: {
-        responsive:true,
-        plugins: {
-          legend:{ display:true, labels:{ color:cc0.legend, font:{size:10}, boxWidth:12, usePointStyle:true } },
-          tooltip:{ callbacks:{ label: c => ` ${c.dataset.label}: ${c.parsed.y != null ? c.parsed.y.toFixed(3) : '—'} mg` } }
-        },
-        scales: {
-          x:{ ticks:{color:cc0.tick,font:{size:10}}, grid:{color:cc0.grid} },
-          y:{ ticks:{color:cc0.tick,font:{size:10}}, grid:{color:cc0.grid}, title:{display:true,text:'mg CO₂ / token',color:cc0.tick,font:{size:10}}, beginAtZero:true }
-        }
-      }
-    });
-  } else {
-    // J/token mode: power_watts_avg_24h / (prompt+gen)_tokens_per_sec_avg_24h.
-    // Uses 24h averages (same source the CO₂/token chart uses) rather than
-    // instantaneous tokens_per_sec, which is almost never >5 for bursty
-    // personal-use traffic even though real generation happened in the window.
-    const bm = models.filter(m => {
-      const tok = (m.prompt_tokens_per_sec_avg_24h||0) + (m.generation_tokens_per_sec_avg_24h||0);
-      return tok > 0.1 && m.power_watts_avg_24h > 0;
-    }).slice().sort((a,b) => {
-      const jA = a.power_watts_avg_24h / ((a.prompt_tokens_per_sec_avg_24h||0)+(a.generation_tokens_per_sec_avg_24h||0));
-      const jB = b.power_watts_avg_24h / ((b.prompt_tokens_per_sec_avg_24h||0)+(b.generation_tokens_per_sec_avg_24h||0));
-      return jA - jB;
-    });
-    const labels = bm.map(m => shortModel(m.model_name) || m.container);
-    const jPerToken = bm.map(m => {
-      const tok = (m.prompt_tokens_per_sec_avg_24h||0) + (m.generation_tokens_per_sec_avg_24h||0);
-      return +(m.power_watts_avg_24h / tok).toFixed(3);
-    });
-    // Neutral magnitude scale (single accent hue, no green/red judgment) —
-    // J/token reflects batch size and workload as much as GPU health; a
-    // personal single-user box naturally runs higher J/token than a
-    // heavily-batched datacenter server, and that's expected, not a problem.
-    const maxJ = Math.max(...jPerToken, 1);
-    const colors = jPerToken.map(j => {
-      const t = Math.min(j / maxJ, 1);
-      const alpha = 0.35 + t * 0.5;
-      return `rgba(99,102,241,${alpha.toFixed(2)})`;
-    });
-    // GPU type annotation for context
-    const gpuLabels = bm.map(m => `${m.gpu_count}× ${m.gpu_hardware||'?'}`);
-    barChart = new Chart(document.getElementById('barChart'), {
-      type: 'bar',
-      data: { labels, datasets: [
-        { label:'J / token (24h avg)', data:jPerToken, backgroundColor:colors, borderRadius:4 },
-      ]},
-      options: {
-        responsive:true,
-        plugins: {
-          legend:{ display:false },
-          tooltip:{ callbacks:{
-            title: (items) => { const i=items[0].dataIndex; return `${labels[i]} (${gpuLabels[i]})`; },
-            label: c => {
-              const mm = bm[c.dataIndex];
-              const tok = (mm.prompt_tokens_per_sec_avg_24h||0) + (mm.generation_tokens_per_sec_avg_24h||0);
-              return ` ${c.parsed.y.toFixed(3)} J/token  ·  ${mm.power_watts_avg_24h.toFixed(1)} W avg  ·  ${tok.toFixed(1)} tok/s avg (24h)`;
-            }
-          }}
-        },
-        scales: {
-          x:{ ticks:{color:cc0.tick,font:{size:10}}, grid:{color:cc0.grid} },
-          y:{ ticks:{color:cc0.tick,font:{size:10}}, grid:{color:cc0.grid}, title:{display:true,text:'Joules / token (24h avg)',color:cc0.tick,font:{size:10}}, beginAtZero:true }
-        }
-      }
-    });
-  }
-}
-
 async function load() {
   const st = document.getElementById('status');
   try {
@@ -410,14 +292,20 @@ function render(data) {
     <div class="stat"><div class="stat-label">Avg Grid Intensity</div><div class="stat-value">${fmt(avgIntensity,3)}</div><div class="stat-unit">kg CO₂/kWh</div></div>
   `;
 
-  renderBarChart(models);
-
   // Model cards
   document.getElementById('cards').innerHTML = models.map(m=>{
     const active = m.tokens_per_sec > 0.1;
     const cc  = co2Color(m.co2_grams_per_hour);
     const dot = intensityColor(m.carbon_intensity_kg_per_kwh);
     const promptPct = active && m.tokens_per_sec > 0 ? (m.prompt_tokens_per_sec / m.tokens_per_sec * 100) : null;
+
+    // J/token = power_watts_avg_24h / (prompt+gen)_tokens_per_sec_avg_24h, gated
+    // the same way the removed comparison chart gated it — plain number, '—'
+    // when there isn't enough data, no comparison framing.
+    const jTok = (m.prompt_tokens_per_sec_avg_24h||0) + (m.generation_tokens_per_sec_avg_24h||0);
+    const jPerToken = jTok > 0.1 && m.power_watts_avg_24h > 0
+      ? m.power_watts_avg_24h / jTok
+      : null;
 
     // Frontier-model comparison: shown only while actively generating (24h-avg
     // combined tok/s > 1) — while idle this is omitted entirely, not shown as
@@ -477,6 +365,7 @@ function render(data) {
         <div class="metric"><div class="metric-label">CO₂ / token</div><div class="metric-value">${m.co2_mg_per_token?fmt(m.co2_mg_per_token,3):'—'}</div><div class="metric-unit">mg · 5 min${m.co2_mg_per_token_avg_24h ? ` · <span style="color:var(--muted)">24h avg: ${fmt(m.co2_mg_per_token_avg_24h,3)}</span>` : ''}</div></div>
         <div class="metric"><div class="metric-label">Input tok/s</div><div class="metric-value">${active?fmt(m.prompt_tokens_per_sec):'—'}</div><div class="metric-unit">tok/s prompt</div></div>
         <div class="metric"><div class="metric-label">Output tok/s</div><div class="metric-value">${active?fmt(m.generation_tokens_per_sec):'—'}</div><div class="metric-unit">tok/s generated</div></div>
+        <div class="metric"><div class="metric-label">J / token</div><div class="metric-value">${jPerToken!=null?fmt(jPerToken,3):'—'}</div><div class="metric-unit">joules · 24h avg</div></div>
         ${frontierMetric}
       </div>
       ${wattsCmp}
@@ -616,15 +505,6 @@ document.querySelectorAll('#time-range-tabs .range-tab').forEach(btn => {
     currentRange = btn.dataset.range;
     if (lineChart) { lineChart.destroy(); lineChart = null; }
     loadTimeSeries(currentRange);
-  });
-});
-
-document.querySelectorAll('#bar-mode-tabs .range-tab').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('#bar-mode-tabs .range-tab').forEach(b=>b.classList.remove('active'));
-    btn.classList.add('active');
-    barMode = btn.dataset.mode;
-    if (lastData) renderBarChart(lastData.models || []);
   });
 });
 
