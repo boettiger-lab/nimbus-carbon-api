@@ -117,7 +117,7 @@
 </head>
 <body>
 <header>
-  <h1>nimbus <span>Carbon</span> Dashboard</h1>
+  <h1 id="page-title">nimbus <span>Carbon</span> Dashboard</h1>
   <div class="header-right">
     <a class="method-link" href="/methodology">Methodology</a>
     <a class="method-link" href="https://github.com/boettiger-lab/nimbus-carbon-api" target="_blank">GitHub</a>
@@ -282,6 +282,12 @@ function render(data) {
   lastData = data;
   const models = (data.models||[]).slice().sort((a,b)=>b.co2_grams_per_hour-a.co2_grams_per_hour);
 
+  // Brand the page from the node reported by the API (nimbus, cirrus, ...).
+  const nodeName = (models[0] && models[0].node) || 'GPU';
+  document.title = `${nodeName} Carbon Dashboard`;
+  const h1 = document.getElementById('page-title');
+  if (h1) h1.innerHTML = `${nodeName} <span>Carbon</span> Dashboard`;
+
   const totalPower   = models.reduce((s,m)=>s+m.power_watts,0);
   const totalCO2hr   = models.reduce((s,m)=>s+m.co2_grams_per_hour,0);
   const totalGPUs    = models.reduce((s,m)=>s+m.gpu_count,0);
@@ -339,13 +345,13 @@ function render(data) {
       const fMargW = fw - fIdleW;
       wattsCmp = `
         <div class="token-cmp">
-          <div class="token-cmp-label">Power (${windowLabel}): nimbus vs. ${FRONTIER.label} for same tokens</div>
+          <div class="token-cmp-label">Power (${windowLabel}): ${m.node} vs. ${FRONTIER.label} for same tokens</div>
           <div class="token-cmp-track">
             <div class="token-cmp-bar" style="width:${nrpPct}%;background:#6366f1;top:2px;height:14px;border-radius:2px"></div>
             <div style="position:absolute;top:2px;left:0;width:100%;height:14px;border-radius:2px;background:rgba(99,102,241,0.18)"></div>
           </div>
           <div class="token-cmp-legend">
-            <span style="color:var(--text)">nimbus: ${nrpW.toLocaleString(undefined,{maximumFractionDigits:0})} W</span>
+            <span style="color:var(--text)">${m.node}: ${nrpW.toLocaleString(undefined,{maximumFractionDigits:0})} W</span>
             <span style="color:#6366f1">${FRONTIER.label}: ${fw.toLocaleString(undefined,{maximumFractionDigits:0})} W <span style="opacity:.6">(${fIdleW.toLocaleString()} idle + ${fMargW.toLocaleString(undefined,{maximumFractionDigits:0})} marginal)</span></span>
           </div>
           <div class="token-cmp-ratio">${ratioText}</div>
