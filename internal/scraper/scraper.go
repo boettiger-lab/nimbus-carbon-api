@@ -58,8 +58,13 @@ type ModelMetrics struct {
 	GPUCount               int     `json:"gpu_count"`
 	PowerWatts             float64 `json:"power_watts"`
 	PromptTokensPerSec     float64 `json:"prompt_tokens_per_sec"`     // input (prefill) token rate
-	GenerationTokensPerSec float64 `json:"generation_tokens_per_sec"` // output (decode) token rate
-	TokensPerSec           float64 `json:"tokens_per_sec"`            // total = prompt + generation
+	GenerationTokensPerSec float64 `json:"generation_tokens_per_sec"` // output throughput over wall-clock (incl. idle gaps)
+	TokensPerSec           float64 `json:"tokens_per_sec"`            // total throughput = prompt + generation
+	// DecodeTokensPerSec is the ACTUAL generation speed while generating —
+	// the inverse of vLLM's mean inter-token latency, so it is not diluted by
+	// idle time between requests (unlike the throughput rates above). This is
+	// the "N tok/s" figure people usually quote. Omitted when idle.
+	DecodeTokensPerSec float64 `json:"decode_tokens_per_sec,omitempty"`
 
 	// Carbon
 	CarbonIntensity     float64 `json:"carbon_intensity_kg_per_kwh"`
@@ -417,6 +422,11 @@ func (s *Scraper) scrape() {
 		log.Printf("scraper: MTP acceptance query failed: %v", err)
 	}
 
+	decodeSpeedByKey, err := s.queryDecodeSpeed()
+	if err != nil {
+		log.Printf("scraper: decode speed query failed: %v", err)
+	}
+
 	keys := make(map[string]struct{})
 	for k := range powerByKey {
 		keys[k] = struct{}{}
@@ -473,6 +483,9 @@ func (s *Scraper) scrape() {
 		}
 		if mtp, ok := mtpAcceptanceByKey[key]; ok {
 			m.MTPAcceptancePerc = math.Round(mtp*10) / 10
+		}
+		if ds, ok := decodeSpeedByKey[key]; ok && ds > 0 {
+			m.DecodeTokensPerSec = math.Round(ds*10) / 10
 		}
 
 		s.models[key] = m
@@ -645,6 +658,32 @@ func (s *Scraper) queryRequestRate() (map[string]float64, error) {
 		rate[r.Metric["namespace"]] = r.Value
 	}
 	return rate, nil
+}
+
+// queryDecodeSpeed returns the actual generation speed (output tokens/sec
+// while generating) keyed by namespace, computed as the inverse of vLLM's
+// mean inter-token latency over a 2-minute window: rate(count)/rate(sum) of
+// the inter_token_latency_seconds histogram. Unlike the wall-clock token
+// rate, this excludes idle time between requests, so it reflects the real
+// per-token decode rate (e.g. ~140 tok/s here) rather than a utilization
+// average. Idle namespaces produce no series (0/0) and are simply absent.
+func (s *Scraper) queryDecodeSpeed() (map[string]float64, error) {
+	ns := s.cfg.Namespace
+	results, err := s.client.Query(
+		fmt.Sprintf(`sum by (namespace) (rate(vllm:inter_token_latency_seconds_count{namespace=%q}[2m]))
+			/ sum by (namespace) (rate(vllm:inter_token_latency_seconds_sum{namespace=%q}[2m]))`, ns, ns),
+	)
+	if err != nil {
+		return nil, err
+	}
+	speed := make(map[string]float64)
+	for _, r := range results {
+		if math.IsNaN(r.Value) || math.IsInf(r.Value, 0) {
+			continue
+		}
+		speed[r.Metric["namespace"]] = r.Value
+	}
+	return speed, nil
 }
 
 // queryMTPAcceptance returns the speculative-decoding (MTP) draft-token
