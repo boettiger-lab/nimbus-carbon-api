@@ -661,25 +661,28 @@ func (s *Scraper) queryRequestRate() (map[string]float64, error) {
 }
 
 // queryDecodeSpeed returns the actual generation speed (output tokens/sec
-// while generating) keyed by namespace: the real generation-token rate
-// divided by the fraction of the window the engine was actually busy, so it
-// excludes idle gaps between requests and reflects the true per-token decode
-// rate (e.g. ~140 tok/s) rather than a wall-clock utilization average.
+// while generating) keyed by namespace: total generation tokens divided by
+// total time actually spent generating, over a 2-minute window. This excludes
+// idle gaps between requests and reflects the true per-token decode rate
+// (e.g. ~138 tok/s) rather than a wall-clock utilization average.
 //
-// NOTE: we deliberately do NOT use inter_token_latency_seconds here. Under MTP
-// speculative decoding that histogram records one sample per engine STEP, and
-// a step emits multiple accepted tokens, so its inverse undercounts true
-// tokens/sec by the acceptance factor (~3x). generation_tokens_total is the
-// real emitted-token counter, so rate(tokens)/busy_fraction is MTP-correct.
+//	decode tok/s = rate(vllm:generation_tokens_total) / rate(vllm:inter_token_latency_seconds_sum)
 //
-// busy_fraction = avg_over_time((num_requests_running > 0)[w]) — the share of
-// the window with at least one request in flight. Fully-idle namespaces give
-// 0/0 -> NaN (filtered), so they're simply absent.
+// The _sum of the inter-token-latency histogram accumulates step latency, i.e.
+// the total wall-time the engine spent producing tokens, so it only advances
+// while generating — dividing tokens by it yields the active decode rate with
+// no idle dilution and no busy-fraction estimate needed. It is MTP-correct:
+// generation_tokens_total counts every emitted token (a step that accepts 3
+// speculative tokens counts all 3), unlike inter_token_latency_count which
+// records one sample per step and would undercount ~3x. Numerator and
+// denominator scale together with load, so the ratio is stable even when the
+// window is only partly busy. Fully-idle namespaces give 0/0 -> NaN
+// (filtered), so they're simply absent.
 func (s *Scraper) queryDecodeSpeed() (map[string]float64, error) {
 	ns := s.cfg.Namespace
 	results, err := s.client.Query(
 		fmt.Sprintf(`sum by (namespace) (rate(vllm:generation_tokens_total{namespace=%q}[2m]))
-			/ avg_over_time((sum by (namespace) (vllm:num_requests_running{namespace=%q}) > bool 0)[2m:15s])`, ns, ns),
+			/ sum by (namespace) (rate(vllm:inter_token_latency_seconds_sum{namespace=%q}[2m]))`, ns, ns),
 	)
 	if err != nil {
 		return nil, err
