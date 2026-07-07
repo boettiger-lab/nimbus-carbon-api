@@ -356,9 +356,10 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
 
 <h3>Live activity metrics</h3>
 <p>
-  Each model card also shows a "Live Activity" panel with real-time engine
-  state, read directly from vLLM and DCGM rather than derived from carbon
-  math. Unlike CO₂/token or J/token, these are absolute engine-state readings
+  Each model also gets a companion "Live Activity" card, shown alongside its
+  main carbon card, with real-time engine state read directly from vLLM and
+  DCGM rather than derived from carbon math. Unlike CO₂/token or J/token,
+  these are absolute engine-state readings
   — a value of zero is exactly as meaningful as any other value, so none of
   them are gated behind a minimum-throughput threshold:
 </p>
