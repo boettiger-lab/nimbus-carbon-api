@@ -318,6 +318,15 @@ function render(data) {
       ? m.power_watts_avg_24h / jTok
       : null;
 
+    // While idle there's no live decode speed or active power draw to show —
+    // fall back to the long-term active-only average (24h, then 7d) so a
+    // visitor still gets an estimate of how fast it runs / how much power it
+    // draws when actually working, instead of a bare '—'.
+    const decodeAvgWindow = m.decode_tokens_per_sec_avg_24h ? '24h' : (m.decode_tokens_per_sec_avg_7d ? '7d' : null);
+    const decodeAvgVal = m.decode_tokens_per_sec_avg_24h || m.decode_tokens_per_sec_avg_7d || null;
+    const powerActiveWindow = m.power_watts_active_avg_24h ? '24h' : (m.power_watts_active_avg_7d ? '7d' : null);
+    const powerActiveVal = m.power_watts_active_avg_24h || m.power_watts_active_avg_7d || null;
+
     // Frontier-model comparison: shown only while actively generating (24h-avg
     // combined tok/s > 1) — while idle this is omitted entirely, not shown as
     // good or bad. Plain informational text/visualization only, no color
@@ -373,10 +382,10 @@ function render(data) {
       </div>
       <div class="metrics">
         <div class="metric"><div class="metric-label">CO₂ / hr</div><div class="metric-value ${cc}">${fmt(m.co2_grams_per_hour)}</div><div class="metric-unit">grams</div></div>
-        <div class="metric"><div class="metric-label">GPU Power</div><div class="metric-value">${fmt(m.power_watts)}</div><div class="metric-unit">watts</div></div>
+        <div class="metric"><div class="metric-label">GPU Power</div><div class="metric-value">${fmt(m.power_watts)}</div><div class="metric-unit">watts${!active && powerActiveVal!=null ? ` · <span style="color:var(--muted)">${fmt(powerActiveVal)} W ${powerActiveWindow} avg when active</span>` : ''}</div></div>
         <div class="metric"><div class="metric-label">CO₂ / token</div><div class="metric-value">${m.co2_mg_per_token?fmt(m.co2_mg_per_token,3):'—'}</div><div class="metric-unit">mg · 5 min${m.co2_mg_per_token_avg_24h ? ` · <span style="color:var(--muted)">24h avg: ${fmt(m.co2_mg_per_token_avg_24h,3)}</span>` : ''}</div></div>
         <div class="metric"><div class="metric-label">Input tok/s</div><div class="metric-value">${active?fmt(m.prompt_tokens_per_sec):'—'}</div><div class="metric-unit">tok/s prompt</div></div>
-        <div class="metric"><div class="metric-label">Decode speed</div><div class="metric-value">${m.decode_tokens_per_sec?fmt(m.decode_tokens_per_sec):(active?fmt(m.generation_tokens_per_sec):'—')}</div><div class="metric-unit">tok/s generating${active?` · <span style="color:var(--muted)">${fmt(m.generation_tokens_per_sec)} throughput</span>`:''}</div></div>
+        <div class="metric"><div class="metric-label">Decode speed</div><div class="metric-value">${m.decode_tokens_per_sec?fmt(m.decode_tokens_per_sec):(active?fmt(m.generation_tokens_per_sec):(decodeAvgVal!=null?fmt(decodeAvgVal):'—'))}</div><div class="metric-unit">${m.decode_tokens_per_sec?`tok/s generating${active?` · <span style="color:var(--muted)">${fmt(m.generation_tokens_per_sec)} throughput</span>`:''}`:(!active && decodeAvgVal!=null?`tok/s · <span style="color:var(--muted)">${decodeAvgWindow} avg when active</span>`:'tok/s generating')}</div></div>
         <div class="metric"><div class="metric-label">J / token</div><div class="metric-value">${jPerToken!=null?fmt(jPerToken,3):'—'}</div><div class="metric-unit">joules · 24h avg</div></div>
         ${frontierMetric}
       </div>

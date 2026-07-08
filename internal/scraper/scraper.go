@@ -78,6 +78,17 @@ type ModelMetrics struct {
 	PromptTokensPerSecAvg24h     float64 `json:"prompt_tokens_per_sec_avg_24h,omitempty"`
 	GenerationTokensPerSecAvg24h float64 `json:"generation_tokens_per_sec_avg_24h,omitempty"`
 
+	// Active-only long-term means, so a visitor who loads the dashboard while
+	// the model is idle still sees a meaningful estimate of how fast it runs
+	// and how much power it draws when actually working, instead of a blank
+	// or a wall-clock-diluted number. PowerWattsActive* is gated the same way
+	// as CO2MgPerTokenAvg* (totalTok > 5 = non-idle); DecodeTokensPerSecAvg*
+	// is gated on having had a valid (non-idle) decode-speed reading at all.
+	PowerWattsActiveAvg24h   float64 `json:"power_watts_active_avg_24h,omitempty"`
+	PowerWattsActiveAvg7d    float64 `json:"power_watts_active_avg_7d,omitempty"`
+	DecodeTokensPerSecAvg24h float64 `json:"decode_tokens_per_sec_avg_24h,omitempty"`
+	DecodeTokensPerSecAvg7d  float64 `json:"decode_tokens_per_sec_avg_7d,omitempty"`
+
 	// Live engine activity, read directly from vLLM/DCGM.
 	NumRequestsRunning float64 `json:"num_requests_running"`
 	NumRequestsWaiting float64 `json:"num_requests_waiting"`
@@ -106,7 +117,8 @@ type dataPoint struct {
 
 // avgBucket holds one hour of aggregates: a token-weighted CO₂/token mean
 // (active samples only) plus time-weighted means for power, prompt tok/s,
-// and generation tok/s (every reporting sample, active or idle).
+// and generation tok/s (every reporting sample, active or idle), plus
+// active-only sums for power and decode speed.
 type avgBucket struct {
 	Hour         int64
 	WeightedSum  float64
@@ -115,6 +127,15 @@ type avgBucket struct {
 	PromptTokSum float64
 	GenTokSum    float64
 	SampleCount  int
+
+	// ActivePowerSum/ActiveSampleCount are gated on totalTok > 5 (same "non-
+	// idle" definition as WeightedSum/TokenSum above). DecodeSum/
+	// DecodeSampleCount are gated on having had a valid decode-speed reading
+	// at all (queryDecodeSpeed already omits idle samples as NaN).
+	ActivePowerSum    float64
+	ActiveSampleCount int
+	DecodeSum         float64
+	DecodeSampleCount int
 }
 
 const maxBuckets = 168   // 7 days of hourly buckets
@@ -139,16 +160,17 @@ func (h *modelHistory) append(now time.Time, m *ModelMetrics) {
 	if m.CO2MgPerToken > 0 {
 		push(&h.CO2MgPerToken, m.CO2MgPerToken)
 	}
-	h.addSample(now, m.PowerWatts, m.PromptTokensPerSec, m.GenerationTokensPerSec, m.CarbonIntensity)
+	h.addSample(now, m.PowerWatts, m.PromptTokensPerSec, m.GenerationTokensPerSec, m.DecodeTokensPerSec, m.CarbonIntensity)
 }
 
-func (h *modelHistory) addSample(t time.Time, power, promptTok, genTok, intensity float64) {
+func (h *modelHistory) addSample(t time.Time, power, promptTok, genTok, decodeTok, intensity float64) {
 	if power <= 0 {
 		return
 	}
 	totalTok := promptTok + genTok
+	active := totalTok > 5.0
 	var co2Weight, co2Tokens float64
-	if totalTok > 5.0 {
+	if active {
 		co2PerToken := carbon.MgPerToken(power, intensity, totalTok)
 		co2Weight = co2PerToken * totalTok
 		co2Tokens = totalTok
@@ -163,10 +185,18 @@ func (h *modelHistory) addSample(t time.Time, power, promptTok, genTok, intensit
 			b.PromptTokSum += promptTok
 			b.GenTokSum += genTok
 			b.SampleCount++
+			if active {
+				b.ActivePowerSum += power
+				b.ActiveSampleCount++
+			}
+			if decodeTok > 0 {
+				b.DecodeSum += decodeTok
+				b.DecodeSampleCount++
+			}
 			return
 		}
 	}
-	h.AvgBuckets = append(h.AvgBuckets, avgBucket{
+	nb := avgBucket{
 		Hour:         hourKey,
 		WeightedSum:  co2Weight,
 		TokenSum:     co2Tokens,
@@ -174,7 +204,16 @@ func (h *modelHistory) addSample(t time.Time, power, promptTok, genTok, intensit
 		PromptTokSum: promptTok,
 		GenTokSum:    genTok,
 		SampleCount:  1,
-	})
+	}
+	if active {
+		nb.ActivePowerSum = power
+		nb.ActiveSampleCount = 1
+	}
+	if decodeTok > 0 {
+		nb.DecodeSum = decodeTok
+		nb.DecodeSampleCount = 1
+	}
+	h.AvgBuckets = append(h.AvgBuckets, nb)
 	if len(h.AvgBuckets) > maxBuckets {
 		h.AvgBuckets = h.AvgBuckets[len(h.AvgBuckets)-maxBuckets:]
 	}
@@ -282,8 +321,16 @@ func (s *Scraper) backfill() {
 		log.Printf("scraper: backfill generation token query failed: %v", err)
 		return
 	}
+	latencySeries, err := s.client.RangeQuery(
+		fmt.Sprintf(`sum by (namespace) (rate(vllm:inter_token_latency_seconds_sum{namespace=%q}[5m]))`, ns),
+		start, end, step,
+	)
+	if err != nil {
+		log.Printf("scraper: backfill latency query failed: %v", err)
+		return
+	}
 
-	type sample struct{ power, promptTok, genTok float64 }
+	type sample struct{ power, promptTok, genTok, latencySum float64 }
 	byKeyTime := make(map[string]map[int64]*sample)
 	ensure := func(key string) map[int64]*sample {
 		if byKeyTime[key] == nil {
@@ -322,6 +369,16 @@ func (s *Scraper) backfill() {
 			m[ts].genTok += pt.Value
 		}
 	}
+	for _, sr := range latencySeries {
+		m := ensure(sr.Metric["namespace"])
+		for _, pt := range sr.Points {
+			ts := pt.Time.Unix()
+			if m[ts] == nil {
+				m[ts] = &sample{}
+			}
+			m[ts].latencySum += pt.Value
+		}
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -335,7 +392,11 @@ func (s *Scraper) backfill() {
 			if samp.power <= 0 {
 				continue
 			}
-			h.addSample(time.Unix(ts, 0), samp.power, samp.promptTok, samp.genTok, carbon.BerkeleyIntensity)
+			decodeTok := 0.0
+			if samp.latencySum > 0 {
+				decodeTok = samp.genTok / samp.latencySum
+			}
+			h.addSample(time.Unix(ts, 0), samp.power, samp.promptTok, samp.genTok, decodeTok, carbon.BerkeleyIntensity)
 		}
 	}
 
@@ -496,34 +557,67 @@ func (s *Scraper) scrape() {
 		h := s.history[key]
 		h.append(now, m)
 
-		co2Avg24h, co2Avg7d, powerAvg24h, promptAvg24h, genAvg24h := average24h7d(now, h.AvgBuckets)
-		if co2Avg24h != 0 {
-			m.CO2MgPerTokenAvg24h = co2Avg24h
+		avgs := average24h7d(now, h.AvgBuckets)
+		if avgs.CO2Avg24h != 0 {
+			m.CO2MgPerTokenAvg24h = avgs.CO2Avg24h
 		}
-		if co2Avg7d != 0 {
-			m.CO2MgPerTokenAvg7d = co2Avg7d
+		if avgs.CO2Avg7d != 0 {
+			m.CO2MgPerTokenAvg7d = avgs.CO2Avg7d
 		}
-		if powerAvg24h != 0 {
-			m.PowerWattsAvg24h = powerAvg24h
-			m.PromptTokensPerSecAvg24h = promptAvg24h
-			m.GenerationTokensPerSecAvg24h = genAvg24h
+		if avgs.PowerAvg24h != 0 {
+			m.PowerWattsAvg24h = avgs.PowerAvg24h
+			m.PromptTokensPerSecAvg24h = avgs.PromptAvg24h
+			m.GenerationTokensPerSecAvg24h = avgs.GenAvg24h
+		}
+		if avgs.PowerActiveAvg24h != 0 {
+			m.PowerWattsActiveAvg24h = avgs.PowerActiveAvg24h
+		}
+		if avgs.PowerActiveAvg7d != 0 {
+			m.PowerWattsActiveAvg7d = avgs.PowerActiveAvg7d
+		}
+		if avgs.DecodeAvg24h != 0 {
+			m.DecodeTokensPerSecAvg24h = avgs.DecodeAvg24h
+		}
+		if avgs.DecodeAvg7d != 0 {
+			m.DecodeTokensPerSecAvg7d = avgs.DecodeAvg7d
 		}
 	}
 }
 
+// windowAverages holds every rolling-window mean derived from a model's
+// hourly avgBuckets: CO2/token and active-only power/decode means at 24h and
+// 7d, plus the 24h time-weighted power/prompt/gen-token means (all samples).
+type windowAverages struct {
+	CO2Avg24h, CO2Avg7d       float64
+	PowerAvg24h               float64
+	PromptAvg24h, GenAvg24h   float64
+	PowerActiveAvg24h         float64
+	PowerActiveAvg7d          float64
+	DecodeAvg24h, DecodeAvg7d float64
+}
+
 // average24h7d computes the 24h/7d token-weighted CO₂/token means (active
-// samples only) and the 24h time-weighted power/prompt/gen-token means (every
-// reporting sample). Each return value is 0 when it could not be computed.
-func average24h7d(now time.Time, buckets []avgBucket) (co2Avg24h, co2Avg7d, powerAvg24h, promptAvg24h, genAvg24h float64) {
+// samples only), the 24h time-weighted power/prompt/gen-token means (every
+// reporting sample), and the 24h/7d active-only power and decode-speed means.
+// Each field is 0 when it could not be computed (no data in that window).
+func average24h7d(now time.Time, buckets []avgBucket) windowAverages {
 	var wSum24, tSum24, wSum7d, tSum7d float64
 	var powSum24, promptSum24, genSum24 float64
 	var sampleSum24 int
+	var activePowSum24, activePowSum7d float64
+	var activeCount24, activeCount7d int
+	var decodeSum24, decodeSum7d float64
+	var decodeCount24, decodeCount7d int
 	cutoff24h := now.Add(-24 * time.Hour).Truncate(time.Hour).Unix()
 	cutoff7d := now.Add(-7 * 24 * time.Hour).Truncate(time.Hour).Unix()
 	for _, b := range buckets {
 		if b.Hour >= cutoff7d {
 			wSum7d += b.WeightedSum
 			tSum7d += b.TokenSum
+			activePowSum7d += b.ActivePowerSum
+			activeCount7d += b.ActiveSampleCount
+			decodeSum7d += b.DecodeSum
+			decodeCount7d += b.DecodeSampleCount
 		}
 		if b.Hour >= cutoff24h {
 			wSum24 += b.WeightedSum
@@ -532,21 +626,38 @@ func average24h7d(now time.Time, buckets []avgBucket) (co2Avg24h, co2Avg7d, powe
 			promptSum24 += b.PromptTokSum
 			genSum24 += b.GenTokSum
 			sampleSum24 += b.SampleCount
+			activePowSum24 += b.ActivePowerSum
+			activeCount24 += b.ActiveSampleCount
+			decodeSum24 += b.DecodeSum
+			decodeCount24 += b.DecodeSampleCount
 		}
 	}
+	var out windowAverages
 	if tSum24 > 0 {
-		co2Avg24h = math.Round(wSum24/tSum24*1000) / 1000
+		out.CO2Avg24h = math.Round(wSum24/tSum24*1000) / 1000
 	}
 	if tSum7d > 0 {
-		co2Avg7d = math.Round(wSum7d/tSum7d*1000) / 1000
+		out.CO2Avg7d = math.Round(wSum7d/tSum7d*1000) / 1000
 	}
 	if sampleSum24 > 0 {
 		n := float64(sampleSum24)
-		powerAvg24h = math.Round(powSum24/n*10) / 10
-		promptAvg24h = math.Round(promptSum24/n*10) / 10
-		genAvg24h = math.Round(genSum24/n*10) / 10
+		out.PowerAvg24h = math.Round(powSum24/n*10) / 10
+		out.PromptAvg24h = math.Round(promptSum24/n*10) / 10
+		out.GenAvg24h = math.Round(genSum24/n*10) / 10
 	}
-	return
+	if activeCount24 > 0 {
+		out.PowerActiveAvg24h = math.Round(activePowSum24/float64(activeCount24)*10) / 10
+	}
+	if activeCount7d > 0 {
+		out.PowerActiveAvg7d = math.Round(activePowSum7d/float64(activeCount7d)*10) / 10
+	}
+	if decodeCount24 > 0 {
+		out.DecodeAvg24h = math.Round(decodeSum24/float64(decodeCount24)*10) / 10
+	}
+	if decodeCount7d > 0 {
+		out.DecodeAvg7d = math.Round(decodeSum7d/float64(decodeCount7d)*10) / 10
+	}
+	return out
 }
 
 // queryPower returns GPU power (W) keyed by namespace (or, in node-power mode,

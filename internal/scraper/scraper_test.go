@@ -28,28 +28,27 @@ func TestAverage24h7d_HighSampleRate(t *testing.T) {
 		})
 	}
 
-	_, _, powerAvg24h, promptAvg24h, genAvg24h := average24h7d(now, buckets)
+	avgs := average24h7d(now, buckets)
 
-	if powerAvg24h != power {
-		t.Errorf("powerAvg24h = %v, want %v (bug: dividing by bucket count instead of sample count)", powerAvg24h, power)
+	if avgs.PowerAvg24h != power {
+		t.Errorf("powerAvg24h = %v, want %v (bug: dividing by bucket count instead of sample count)", avgs.PowerAvg24h, power)
 	}
-	if promptAvg24h != promptTok {
-		t.Errorf("promptAvg24h = %v, want %v", promptAvg24h, promptTok)
+	if avgs.PromptAvg24h != promptTok {
+		t.Errorf("promptAvg24h = %v, want %v", avgs.PromptAvg24h, promptTok)
 	}
-	if genAvg24h != genTok {
-		t.Errorf("genAvg24h = %v, want %v", genAvg24h, genTok)
+	if avgs.GenAvg24h != genTok {
+		t.Errorf("genAvg24h = %v, want %v", avgs.GenAvg24h, genTok)
 	}
 }
 
 // TestAverage24h7d_NoData covers the zero-buckets case: no data yet should
-// yield 0 for all five return values.
+// yield 0 for every field.
 func TestAverage24h7d_NoData(t *testing.T) {
 	now := time.Now()
-	co2Avg24h, co2Avg7d, powerAvg24h, promptAvg24h, genAvg24h := average24h7d(now, nil)
+	avgs := average24h7d(now, nil)
 
-	if co2Avg24h != 0 || co2Avg7d != 0 || powerAvg24h != 0 || promptAvg24h != 0 || genAvg24h != 0 {
-		t.Errorf("expected all zeros for empty buckets, got co2Avg24h=%v co2Avg7d=%v powerAvg24h=%v promptAvg24h=%v genAvg24h=%v",
-			co2Avg24h, co2Avg7d, powerAvg24h, promptAvg24h, genAvg24h)
+	if avgs != (windowAverages{}) {
+		t.Errorf("expected all zeros for empty buckets, got %+v", avgs)
 	}
 }
 
@@ -75,16 +74,16 @@ func TestAverage24h7d_OneSamplePerBucket(t *testing.T) {
 		})
 	}
 
-	_, _, powerAvg24h, promptAvg24h, genAvg24h := average24h7d(now, buckets)
+	avgs := average24h7d(now, buckets)
 
-	if powerAvg24h != power {
-		t.Errorf("powerAvg24h = %v, want %v", powerAvg24h, power)
+	if avgs.PowerAvg24h != power {
+		t.Errorf("powerAvg24h = %v, want %v", avgs.PowerAvg24h, power)
 	}
-	if promptAvg24h != promptTok {
-		t.Errorf("promptAvg24h = %v, want %v", promptAvg24h, promptTok)
+	if avgs.PromptAvg24h != promptTok {
+		t.Errorf("promptAvg24h = %v, want %v", avgs.PromptAvg24h, promptTok)
 	}
-	if genAvg24h != genTok {
-		t.Errorf("genAvg24h = %v, want %v", genAvg24h, genTok)
+	if avgs.GenAvg24h != genTok {
+		t.Errorf("genAvg24h = %v, want %v", avgs.GenAvg24h, genTok)
 	}
 }
 
@@ -113,14 +112,40 @@ func TestAverage24h7d_CO2WeightedMeansUnaffected(t *testing.T) {
 		},
 	}
 
-	co2Avg24h, co2Avg7d, _, _, _ := average24h7d(now, buckets)
+	avgs := average24h7d(now, buckets)
 
-	if co2Avg24h != 10 {
-		t.Errorf("co2Avg24h = %v, want 10", co2Avg24h)
+	if avgs.CO2Avg24h != 10 {
+		t.Errorf("co2Avg24h = %v, want 10", avgs.CO2Avg24h)
 	}
 	wantCO2Avg7d := 500.0 / 30.0 // (100+400) / (10+20), rounded to 3 decimals
 	wantCO2Avg7d = float64(int(wantCO2Avg7d*1000+0.5)) / 1000
-	if co2Avg7d != wantCO2Avg7d {
-		t.Errorf("co2Avg7d = %v, want %v", co2Avg7d, wantCO2Avg7d)
+	if avgs.CO2Avg7d != wantCO2Avg7d {
+		t.Errorf("co2Avg7d = %v, want %v", avgs.CO2Avg7d, wantCO2Avg7d)
+	}
+}
+
+// TestAddSample_ActiveOnlyAveragesExcludeIdle checks that PowerWattsActive*
+// and DecodeTokensPerSec* only average over non-idle samples: an idle sample
+// (no tokens, no decode reading) must not drag down either mean, unlike the
+// existing all-samples PowerWattsAvg24h.
+func TestAddSample_ActiveOnlyAveragesExcludeIdle(t *testing.T) {
+	now := time.Now()
+	h := &modelHistory{}
+
+	// One idle sample (low power, no traffic, no decode reading) ...
+	h.addSample(now, 13.5, 0, 0, 0, 0.2)
+	// ... and one active sample (higher power, real traffic, real decode speed).
+	h.addSample(now, 140.0, 2, 50, 138.0, 0.2)
+
+	avgs := average24h7d(now, h.AvgBuckets)
+
+	if avgs.PowerAvg24h != 76.8 { // (13.5+140)/2 = 76.75, rounded to 1 decimal -- diluted by the idle sample
+		t.Errorf("PowerAvg24h = %v, want 76.8 (all-samples mean should include idle)", avgs.PowerAvg24h)
+	}
+	if avgs.PowerActiveAvg24h != 140.0 {
+		t.Errorf("PowerActiveAvg24h = %v, want 140 (idle sample must be excluded)", avgs.PowerActiveAvg24h)
+	}
+	if avgs.DecodeAvg24h != 138.0 {
+		t.Errorf("DecodeAvg24h = %v, want 138 (idle sample has no decode reading and must be excluded)", avgs.DecodeAvg24h)
 	}
 }
