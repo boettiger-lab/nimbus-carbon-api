@@ -80,14 +80,21 @@ type ModelMetrics struct {
 
 	// Active-only long-term means, so a visitor who loads the dashboard while
 	// the model is idle still sees a meaningful estimate of how fast it runs
-	// and how much power it draws when actually working, instead of a blank
-	// or a wall-clock-diluted number. PowerWattsActive* is gated the same way
-	// as CO2MgPerTokenAvg* (totalTok > 5 = non-idle); DecodeTokensPerSecAvg*
-	// is gated on having had a valid (non-idle) decode-speed reading at all.
-	PowerWattsActiveAvg24h   float64 `json:"power_watts_active_avg_24h,omitempty"`
-	PowerWattsActiveAvg7d    float64 `json:"power_watts_active_avg_7d,omitempty"`
-	DecodeTokensPerSecAvg24h float64 `json:"decode_tokens_per_sec_avg_24h,omitempty"`
-	DecodeTokensPerSecAvg7d  float64 `json:"decode_tokens_per_sec_avg_7d,omitempty"`
+	// and how much power/traffic it handles when actually working, instead of
+	// a blank or a wall-clock-diluted number. PowerWattsActive*/
+	// PromptTokensPerSecActive* are gated the same way as CO2MgPerTokenAvg*
+	// (totalTok > 5 = non-idle); DecodeTokensPerSecAvg* is gated on having had
+	// a valid (non-idle) decode-speed reading at all. These are the fields the
+	// dashboard's "24h Average" card uses end-to-end, so every number in that
+	// card shares the same "while working" framing.
+	PowerWattsActiveAvg24h             float64 `json:"power_watts_active_avg_24h,omitempty"`
+	PowerWattsActiveAvg7d              float64 `json:"power_watts_active_avg_7d,omitempty"`
+	PromptTokensPerSecActiveAvg24h     float64 `json:"prompt_tokens_per_sec_active_avg_24h,omitempty"`
+	PromptTokensPerSecActiveAvg7d      float64 `json:"prompt_tokens_per_sec_active_avg_7d,omitempty"`
+	GenerationTokensPerSecActiveAvg24h float64 `json:"generation_tokens_per_sec_active_avg_24h,omitempty"`
+	GenerationTokensPerSecActiveAvg7d  float64 `json:"generation_tokens_per_sec_active_avg_7d,omitempty"`
+	DecodeTokensPerSecAvg24h           float64 `json:"decode_tokens_per_sec_avg_24h,omitempty"`
+	DecodeTokensPerSecAvg7d            float64 `json:"decode_tokens_per_sec_avg_7d,omitempty"`
 
 	// Live engine activity, read directly from vLLM/DCGM.
 	NumRequestsRunning float64 `json:"num_requests_running"`
@@ -128,14 +135,17 @@ type avgBucket struct {
 	GenTokSum    float64
 	SampleCount  int
 
-	// ActivePowerSum/ActiveSampleCount are gated on totalTok > 5 (same "non-
-	// idle" definition as WeightedSum/TokenSum above). DecodeSum/
-	// DecodeSampleCount are gated on having had a valid decode-speed reading
-	// at all (queryDecodeSpeed already omits idle samples as NaN).
-	ActivePowerSum    float64
-	ActiveSampleCount int
-	DecodeSum         float64
-	DecodeSampleCount int
+	// ActivePowerSum/ActivePromptTokSum/ActiveSampleCount are gated on
+	// totalTok > 5 (same "non-idle" definition as WeightedSum/TokenSum
+	// above). DecodeSum/DecodeSampleCount are gated on having had a valid
+	// decode-speed reading at all (queryDecodeSpeed already omits idle
+	// samples as NaN).
+	ActivePowerSum     float64
+	ActivePromptTokSum float64
+	ActiveGenTokSum    float64
+	ActiveSampleCount  int
+	DecodeSum          float64
+	DecodeSampleCount  int
 }
 
 const maxBuckets = 168   // 7 days of hourly buckets
@@ -187,6 +197,8 @@ func (h *modelHistory) addSample(t time.Time, power, promptTok, genTok, decodeTo
 			b.SampleCount++
 			if active {
 				b.ActivePowerSum += power
+				b.ActivePromptTokSum += promptTok
+				b.ActiveGenTokSum += genTok
 				b.ActiveSampleCount++
 			}
 			if decodeTok > 0 {
@@ -207,6 +219,8 @@ func (h *modelHistory) addSample(t time.Time, power, promptTok, genTok, decodeTo
 	}
 	if active {
 		nb.ActivePowerSum = power
+		nb.ActivePromptTokSum = promptTok
+		nb.ActiveGenTokSum = genTok
 		nb.ActiveSampleCount = 1
 	}
 	if decodeTok > 0 {
@@ -571,9 +585,13 @@ func (s *Scraper) scrape() {
 		}
 		if avgs.PowerActiveAvg24h != 0 {
 			m.PowerWattsActiveAvg24h = avgs.PowerActiveAvg24h
+			m.PromptTokensPerSecActiveAvg24h = avgs.PromptActiveAvg24h
+			m.GenerationTokensPerSecActiveAvg24h = avgs.GenActiveAvg24h
 		}
 		if avgs.PowerActiveAvg7d != 0 {
 			m.PowerWattsActiveAvg7d = avgs.PowerActiveAvg7d
+			m.PromptTokensPerSecActiveAvg7d = avgs.PromptActiveAvg7d
+			m.GenerationTokensPerSecActiveAvg7d = avgs.GenActiveAvg7d
 		}
 		if avgs.DecodeAvg24h != 0 {
 			m.DecodeTokensPerSecAvg24h = avgs.DecodeAvg24h
@@ -593,6 +611,10 @@ type windowAverages struct {
 	PromptAvg24h, GenAvg24h   float64
 	PowerActiveAvg24h         float64
 	PowerActiveAvg7d          float64
+	PromptActiveAvg24h        float64
+	PromptActiveAvg7d         float64
+	GenActiveAvg24h           float64
+	GenActiveAvg7d            float64
 	DecodeAvg24h, DecodeAvg7d float64
 }
 
@@ -605,6 +627,8 @@ func average24h7d(now time.Time, buckets []avgBucket) windowAverages {
 	var powSum24, promptSum24, genSum24 float64
 	var sampleSum24 int
 	var activePowSum24, activePowSum7d float64
+	var activePromptSum24, activePromptSum7d float64
+	var activeGenSum24, activeGenSum7d float64
 	var activeCount24, activeCount7d int
 	var decodeSum24, decodeSum7d float64
 	var decodeCount24, decodeCount7d int
@@ -615,6 +639,8 @@ func average24h7d(now time.Time, buckets []avgBucket) windowAverages {
 			wSum7d += b.WeightedSum
 			tSum7d += b.TokenSum
 			activePowSum7d += b.ActivePowerSum
+			activePromptSum7d += b.ActivePromptTokSum
+			activeGenSum7d += b.ActiveGenTokSum
 			activeCount7d += b.ActiveSampleCount
 			decodeSum7d += b.DecodeSum
 			decodeCount7d += b.DecodeSampleCount
@@ -627,6 +653,8 @@ func average24h7d(now time.Time, buckets []avgBucket) windowAverages {
 			genSum24 += b.GenTokSum
 			sampleSum24 += b.SampleCount
 			activePowSum24 += b.ActivePowerSum
+			activePromptSum24 += b.ActivePromptTokSum
+			activeGenSum24 += b.ActiveGenTokSum
 			activeCount24 += b.ActiveSampleCount
 			decodeSum24 += b.DecodeSum
 			decodeCount24 += b.DecodeSampleCount
@@ -647,9 +675,13 @@ func average24h7d(now time.Time, buckets []avgBucket) windowAverages {
 	}
 	if activeCount24 > 0 {
 		out.PowerActiveAvg24h = math.Round(activePowSum24/float64(activeCount24)*10) / 10
+		out.PromptActiveAvg24h = math.Round(activePromptSum24/float64(activeCount24)*10) / 10
+		out.GenActiveAvg24h = math.Round(activeGenSum24/float64(activeCount24)*10) / 10
 	}
 	if activeCount7d > 0 {
 		out.PowerActiveAvg7d = math.Round(activePowSum7d/float64(activeCount7d)*10) / 10
+		out.PromptActiveAvg7d = math.Round(activePromptSum7d/float64(activeCount7d)*10) / 10
+		out.GenActiveAvg7d = math.Round(activeGenSum7d/float64(activeCount7d)*10) / 10
 	}
 	if decodeCount24 > 0 {
 		out.DecodeAvg24h = math.Round(decodeSum24/float64(decodeCount24)*10) / 10

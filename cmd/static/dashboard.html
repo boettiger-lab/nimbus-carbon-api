@@ -48,6 +48,7 @@
 .cards{display:flex;flex-direction:column;gap:.9rem;}
   .model-row{display:flex;flex-wrap:wrap;gap:.9rem;align-items:flex-start;}
   .card{background:var(--surface);border:1px solid var(--border);border-radius:.75rem;padding:1.1rem;border-left:3px solid var(--border);flex:1 1 340px;max-width:640px;}
+  .avg-card{border-left-color:var(--accent);}
   .activity-card{flex:1 1 280px;max-width:420px;}
   .card-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:.65rem;}
   .model-name{font-size:.83rem;font-weight:600;line-height:1.3;word-break:break-all;}
@@ -310,41 +311,43 @@ function render(data) {
     const dot = intensityColor(m.carbon_intensity_kg_per_kwh);
     const promptPct = active && m.tokens_per_sec > 0 ? (m.prompt_tokens_per_sec / m.tokens_per_sec * 100) : null;
 
-    // J/token = power_watts_avg_24h / (prompt+gen)_tokens_per_sec_avg_24h, gated
-    // the same way the removed comparison chart gated it — plain number, '—'
-    // when there isn't enough data, no comparison framing.
-    const jTok = (m.prompt_tokens_per_sec_avg_24h||0) + (m.generation_tokens_per_sec_avg_24h||0);
-    const jPerToken = jTok > 0.1 && m.power_watts_avg_24h > 0
-      ? m.power_watts_avg_24h / jTok
-      : null;
+    // "24h Average" card: every number here is an active-only long-term mean
+    // (falls back to 7d when a model hasn't been active in the last 24h) —
+    // deliberately never mixed with live/instantaneous readings, which is
+    // what made the old single-card layout hard to parse (a live watts
+    // number sitting next to a 24h-avg J/token sitting next to a "24h avg"
+    // footnote on a different field entirely). Live card and Average card
+    // now mirror each other's metric layout so it's obvious which is which.
+    const avgWindow = m.power_watts_active_avg_24h != null ? '24h' : (m.power_watts_active_avg_7d != null ? '7d' : null);
+    const avgPower  = m.power_watts_active_avg_24h ?? m.power_watts_active_avg_7d ?? null;
+    const avgPrompt = m.prompt_tokens_per_sec_active_avg_24h ?? m.prompt_tokens_per_sec_active_avg_7d ?? null;
+    const avgGen    = m.generation_tokens_per_sec_active_avg_24h ?? m.generation_tokens_per_sec_active_avg_7d ?? null;
+    const avgDecode = m.decode_tokens_per_sec_avg_24h ?? m.decode_tokens_per_sec_avg_7d ?? null;
+    const avgCO2Tok = m.co2_mg_per_token_avg_24h ?? m.co2_mg_per_token_avg_7d ?? null;
+    const avgCO2Hr  = avgPower!=null ? avgPower * m.carbon_intensity_kg_per_kwh : null; // g/hr = W × kg/kWh, same formula as the live tile
+    const hasAvg = avgWindow != null;
 
-    // While idle there's no live decode speed or active power draw to show —
-    // fall back to the long-term active-only average (24h, then 7d) so a
-    // visitor still gets an estimate of how fast it runs / how much power it
-    // draws when actually working, instead of a bare '—'.
-    const decodeAvgWindow = m.decode_tokens_per_sec_avg_24h ? '24h' : (m.decode_tokens_per_sec_avg_7d ? '7d' : null);
-    const decodeAvgVal = m.decode_tokens_per_sec_avg_24h || m.decode_tokens_per_sec_avg_7d || null;
-    const powerActiveWindow = m.power_watts_active_avg_24h ? '24h' : (m.power_watts_active_avg_7d ? '7d' : null);
-    const powerActiveVal = m.power_watts_active_avg_24h || m.power_watts_active_avg_7d || null;
+    // J/token and the frontier comparison were always averaged-window
+    // metrics (never live), so they belong entirely in the Average card now.
+    // Uses avgGen (active-period average generation throughput), not
+    // avgDecode (the instantaneous per-step rate while emitting a token) —
+    // different metrics, and avgGen is the one dimensionally comparable to
+    // avgPrompt for a combined tok/s denominator.
+    const avgTok = (avgPrompt||0) + (avgGen||0);
+    const jPerToken = hasAvg && avgTok > 0.1 && avgPower > 0 ? avgPower / avgTok : null;
 
-    // Frontier-model comparison: shown only while actively generating (24h-avg
-    // combined tok/s > 1) — while idle this is omitted entirely, not shown as
-    // good or bad. Plain informational text/visualization only, no color
-    // verdict: nimbus's absolute power draw is real regardless of how it
-    // compares to a hypothetical 24-GPU commercial cluster, and idling low is
-    // expected behavior for this hardware, not something to judge either way.
-    const avgPrompt = m.prompt_tokens_per_sec_avg_24h ?? m.prompt_tokens_per_sec ?? 0;
-    const avgGen    = m.generation_tokens_per_sec_avg_24h ?? m.generation_tokens_per_sec ?? 0;
-    const isGenerating24h = (avgPrompt + avgGen) > 1;
-    const fw   = frontierWatts(avgPrompt, avgGen);
-    const nrpW = m.power_watts_avg_24h || m.power_watts;
-    const has24h = m.power_watts_avg_24h != null && m.power_watts_avg_24h > 0;
-    const windowLabel = has24h ? '24h avg' : '5-min';
+    // Frontier-model comparison: physics-based estimate of what a commercial
+    // frontier cluster would draw to serve the same tokens. Shown only when
+    // there's an active-period average to compare against. Plain
+    // informational text/visualization only, no color verdict: nimbus's
+    // absolute power draw is real regardless of how it compares to a
+    // hypothetical 24-GPU commercial cluster.
+    const fw = hasAvg ? frontierWatts(avgPrompt||0, avgGen||0) : 0;
     let wattsCmp = '';
     let frontierMetric = '';
-    if (isGenerating24h && nrpW > 0) {
-      const ratio = fw / nrpW;
-      const nrpPct = Math.min(nrpW / fw * 100, 100).toFixed(1);
+    if (hasAvg && avgPower > 0 && fw > 0) {
+      const ratio = fw / avgPower;
+      const nrpPct = Math.min(avgPower / fw * 100, 100).toFixed(1);
       const ratioText = ratio >= 1.05
         ? `${ratio.toFixed(1)}× less energy than ${FRONTIER.label} for same tokens`
         : ratio < 0.95
@@ -354,19 +357,19 @@ function render(data) {
       const fMargW = fw - fIdleW;
       wattsCmp = `
         <div class="token-cmp">
-          <div class="token-cmp-label">Power (${windowLabel}): ${m.node} vs. ${FRONTIER.label} for same tokens</div>
+          <div class="token-cmp-label">Power (${avgWindow} avg, active): ${m.node} vs. ${FRONTIER.label} for same tokens</div>
           <div class="token-cmp-track">
             <div class="token-cmp-bar" style="width:${nrpPct}%;background:#6366f1;top:2px;height:14px;border-radius:2px"></div>
             <div style="position:absolute;top:2px;left:0;width:100%;height:14px;border-radius:2px;background:rgba(99,102,241,0.18)"></div>
           </div>
           <div class="token-cmp-legend">
-            <span style="color:var(--text)">${m.node}: ${nrpW.toLocaleString(undefined,{maximumFractionDigits:0})} W</span>
+            <span style="color:var(--text)">${m.node}: ${avgPower.toLocaleString(undefined,{maximumFractionDigits:0})} W</span>
             <span style="color:#6366f1">${FRONTIER.label}: ${fw.toLocaleString(undefined,{maximumFractionDigits:0})} W <span style="opacity:.6">(${fIdleW.toLocaleString()} idle + ${fMargW.toLocaleString(undefined,{maximumFractionDigits:0})} marginal)</span></span>
           </div>
           <div class="token-cmp-ratio">${ratioText}</div>
         </div>`;
       const frontierUnitText = ratio >= 1.05 ? 'less energy' : ratio < 0.95 ? 'more energy' : 'same energy';
-      frontierMetric = `<div class="metric"><div class="metric-label">vs. ${FRONTIER.label}</div><div class="metric-value">${fmt(fw/nrpW,1)}×</div><div class="metric-unit">${frontierUnitText} · ${windowLabel}</div></div>`;
+      frontierMetric = `<div class="metric"><div class="metric-label">vs. ${FRONTIER.label}</div><div class="metric-value">${fmt(fw/avgPower,1)}×</div><div class="metric-unit">${frontierUnitText} · ${avgWindow} avg</div></div>`;
     }
 
     return `
@@ -377,19 +380,17 @@ function render(data) {
         <span class="badge ${active?'badge-active':'badge-idle'}">${active?'active':'idle'}</span>
       </div>
       <div class="card-meta">
+        <span>Live</span>
         <span>${m.gpu_count}× ${m.gpu_hardware||'—'}</span>
         ${promptPct != null ? `<span>${fmt(promptPct,0)}% input tokens</span>` : ''}
       </div>
       <div class="metrics">
         <div class="metric"><div class="metric-label">CO₂ / hr</div><div class="metric-value ${cc}">${fmt(m.co2_grams_per_hour)}</div><div class="metric-unit">grams</div></div>
-        <div class="metric"><div class="metric-label">GPU Power</div><div class="metric-value">${fmt(m.power_watts)}</div><div class="metric-unit">watts${!active && powerActiveVal!=null ? ` · <span style="color:var(--muted)">${fmt(powerActiveVal)} W ${powerActiveWindow} avg when active</span>` : ''}</div></div>
-        <div class="metric"><div class="metric-label">CO₂ / token</div><div class="metric-value">${m.co2_mg_per_token?fmt(m.co2_mg_per_token,3):'—'}</div><div class="metric-unit">mg · 5 min${m.co2_mg_per_token_avg_24h ? ` · <span style="color:var(--muted)">24h avg: ${fmt(m.co2_mg_per_token_avg_24h,3)}</span>` : ''}</div></div>
+        <div class="metric"><div class="metric-label">GPU Power</div><div class="metric-value">${fmt(m.power_watts)}</div><div class="metric-unit">watts</div></div>
+        <div class="metric"><div class="metric-label">CO₂ / token</div><div class="metric-value">${m.co2_mg_per_token?fmt(m.co2_mg_per_token,3):'—'}</div><div class="metric-unit">mg · 5 min</div></div>
         <div class="metric"><div class="metric-label">Input tok/s</div><div class="metric-value">${active?fmt(m.prompt_tokens_per_sec):'—'}</div><div class="metric-unit">tok/s prompt</div></div>
-        <div class="metric"><div class="metric-label">Decode speed</div><div class="metric-value">${m.decode_tokens_per_sec?fmt(m.decode_tokens_per_sec):(active?fmt(m.generation_tokens_per_sec):(decodeAvgVal!=null?fmt(decodeAvgVal):'—'))}</div><div class="metric-unit">${m.decode_tokens_per_sec?`tok/s generating${active?` · <span style="color:var(--muted)">${fmt(m.generation_tokens_per_sec)} throughput</span>`:''}`:(!active && decodeAvgVal!=null?`tok/s · <span style="color:var(--muted)">${decodeAvgWindow} avg when active</span>`:'tok/s generating')}</div></div>
-        <div class="metric"><div class="metric-label">J / token</div><div class="metric-value">${jPerToken!=null?fmt(jPerToken,3):'—'}</div><div class="metric-unit">joules · 24h avg</div></div>
-        ${frontierMetric}
+        <div class="metric"><div class="metric-label">Decode speed</div><div class="metric-value">${m.decode_tokens_per_sec?fmt(m.decode_tokens_per_sec):(active?fmt(m.generation_tokens_per_sec):'—')}</div><div class="metric-unit">tok/s generating${active&&m.decode_tokens_per_sec?` · <span style="color:var(--muted)">${fmt(m.generation_tokens_per_sec)} throughput</span>`:''}</div></div>
       </div>
-      ${wattsCmp}
       <div class="grid-intensity">
         <div class="grid-intensity-header">
           <span class="grid-location">${locationLabel(m.node)}</span>
@@ -406,6 +407,25 @@ function render(data) {
           <span>coal</span>
         </div>
       </div>
+    </div>
+    <div class="card avg-card">
+      <div class="card-header">
+        <div class="model-name ${m.model_name?'':'unknown'}">${m.model_name||m.container}</div>
+        <span class="badge" style="background:rgba(99,102,241,.15);color:var(--accent)">${hasAvg?`${avgWindow} avg`:'no data yet'}</span>
+      </div>
+      <div class="card-meta">
+        <span>While active, ${avgWindow||'24h'} window</span>
+      </div>
+      <div class="metrics">
+        <div class="metric"><div class="metric-label">CO₂ / hr</div><div class="metric-value ${avgCO2Hr!=null?co2Color(avgCO2Hr):''}">${avgCO2Hr!=null?fmt(avgCO2Hr):'—'}</div><div class="metric-unit">grams</div></div>
+        <div class="metric"><div class="metric-label">GPU Power</div><div class="metric-value">${avgPower!=null?fmt(avgPower):'—'}</div><div class="metric-unit">watts</div></div>
+        <div class="metric"><div class="metric-label">CO₂ / token</div><div class="metric-value">${avgCO2Tok!=null?fmt(avgCO2Tok,3):'—'}</div><div class="metric-unit">mg</div></div>
+        <div class="metric"><div class="metric-label">Input tok/s</div><div class="metric-value">${avgPrompt!=null?fmt(avgPrompt):'—'}</div><div class="metric-unit">tok/s prompt</div></div>
+        <div class="metric"><div class="metric-label">Decode speed</div><div class="metric-value">${avgDecode!=null?fmt(avgDecode):'—'}</div><div class="metric-unit">tok/s generating</div></div>
+        <div class="metric"><div class="metric-label">J / token</div><div class="metric-value">${jPerToken!=null?fmt(jPerToken,3):'—'}</div><div class="metric-unit">joules</div></div>
+        ${frontierMetric}
+      </div>
+      ${wattsCmp}
     </div>
     <div class="card activity-card">
       <div class="card-header">

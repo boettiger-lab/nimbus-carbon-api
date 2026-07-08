@@ -145,6 +145,12 @@ func TestAddSample_ActiveOnlyAveragesExcludeIdle(t *testing.T) {
 	if avgs.PowerActiveAvg24h != 140.0 {
 		t.Errorf("PowerActiveAvg24h = %v, want 140 (idle sample must be excluded)", avgs.PowerActiveAvg24h)
 	}
+	if avgs.PromptActiveAvg24h != 2.0 {
+		t.Errorf("PromptActiveAvg24h = %v, want 2 (idle sample must be excluded)", avgs.PromptActiveAvg24h)
+	}
+	if avgs.GenActiveAvg24h != 50.0 {
+		t.Errorf("GenActiveAvg24h = %v, want 50 (idle sample must be excluded)", avgs.GenActiveAvg24h)
+	}
 	if avgs.DecodeAvg24h != 138.0 {
 		t.Errorf("DecodeAvg24h = %v, want 138 (idle sample has no decode reading and must be excluded)", avgs.DecodeAvg24h)
 	}
