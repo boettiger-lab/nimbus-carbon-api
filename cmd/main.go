@@ -26,22 +26,14 @@ func main() {
 	interval := getenvDuration("SCRAPE_INTERVAL", 30*time.Second)
 	addr := getenv("LISTEN_ADDR", ":8080")
 
-	// Node config, env-overridable. Defaults reproduce the original nimbus
-	// behavior so this same image serves nimbus unchanged; cirrus (shared,
-	// time-sliced 2x RTX 8000) overrides NAMESPACE/NODE_NAME/GPU_* and sets
-	// NODE_POWER=true to attribute total node GPU power to the vLLM namespace.
-	cfg := scraper.DefaultConfig()
-	cfg.Namespace = getenv("NAMESPACE", cfg.Namespace)
-	cfg.NodeName = getenv("NODE_NAME", cfg.NodeName)
-	cfg.GPUHardware = getenv("GPU_HARDWARE", cfg.GPUHardware)
-	cfg.Container = getenv("CONTAINER", cfg.Container)
-	cfg.GPUCount = getenvInt("GPU_COUNT", cfg.GPUCount)
-	cfg.NodePower = getenvBool("NODE_POWER", cfg.NodePower)
+	cfg := loadNodes()
 
 	s = scraper.NewWithConfig(promURL, interval, cfg)
 	go s.Run()
-	log.Printf("carbon-api config: node=%s ns=%s gpu=%q count=%d node_power=%v",
-		cfg.NodeName, cfg.Namespace, cfg.GPUHardware, cfg.GPUCount, cfg.NodePower)
+	for _, n := range cfg.Nodes {
+		log.Printf("carbon-api node: name=%s ns=%s gpu=%q count=%d node_power=%v",
+			n.Name, n.Namespace, n.GPUHardware, n.GPUCount, n.NodePower)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleDashboard)
@@ -57,6 +49,49 @@ func main() {
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// loadNodes builds the node set this instance reports on.
+//
+// Preferred: NODES_FILE (a JSON array from a ConfigMap) or NODES_JSON
+// (the same JSON inline), e.g.
+//
+//	[{"name":"cirrus","namespace":"vllm","gpu_hardware":"Quadro RTX 8000",
+//	  "gpu_count":2,"node_power":true},
+//	 {"name":"nimbus","namespace":"vllm","gpu_hardware":"NVIDIA GB10",
+//	  "gpu_count":1,"node_power":true}]
+//
+// Legacy single-node env vars (NODE_NAME/NAMESPACE/GPU_HARDWARE/GPU_COUNT/
+// CONTAINER/NODE_POWER) still work and describe exactly one node, so an
+// existing per-node Deployment keeps running unchanged.
+func loadNodes() scraper.Config {
+	if path := os.Getenv("NODES_FILE"); path != "" {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			log.Fatalf("reading NODES_FILE %s: %v", path, err)
+		}
+		nodes, err := scraper.ParseNodes(string(raw))
+		if err != nil {
+			log.Fatalf("NODES_FILE %s: %v", path, err)
+		}
+		return scraper.Config{Nodes: nodes}
+	}
+	if raw := os.Getenv("NODES_JSON"); raw != "" {
+		nodes, err := scraper.ParseNodes(raw)
+		if err != nil {
+			log.Fatalf("NODES_JSON: %v", err)
+		}
+		return scraper.Config{Nodes: nodes}
+	}
+
+	single := scraper.DefaultConfig().Nodes[0]
+	single.Name = getenv("NODE_NAME", single.Name)
+	single.Namespace = getenv("NAMESPACE", single.Namespace)
+	single.GPUHardware = getenv("GPU_HARDWARE", single.GPUHardware)
+	single.Container = getenv("CONTAINER", single.Container)
+	single.GPUCount = getenvInt("GPU_COUNT", single.GPUCount)
+	single.NodePower = getenvBool("NODE_POWER", single.NodePower)
+	return scraper.Config{Nodes: []scraper.NodeConfig{single}}
 }
 
 func handleDashboard(w http.ResponseWriter, r *http.Request) {

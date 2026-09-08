@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>nimbus Carbon Dashboard</title>
+<title>Cluster Carbon Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <style>
   :root {
@@ -112,13 +112,19 @@
   body.light .metric{background:rgba(0,0,0,.03);}
   body.light .token-cmp-track{background:rgba(0,0,0,.04);}
 
+  /* Node badge on every card: with more than one node on the page, the model
+     name alone no longer says which machine you are looking at. */
+  .node-tag{display:inline-block;margin-right:.4rem;padding:.05rem .35rem;border-radius:3px;
+    background:rgba(99,102,241,.15);color:var(--accent);font-size:.68rem;font-weight:600;
+    letter-spacing:.03em;text-transform:uppercase;vertical-align:middle;}
+
   #theme-btn{font-size:.72rem;padding:.25rem .65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s;}
   #theme-btn:hover{color:var(--text);border-color:var(--muted);}
 </style>
 </head>
 <body>
 <header>
-  <h1 id="page-title">nimbus <span>Carbon</span> Dashboard</h1>
+  <h1 id="page-title">Cluster <span>Carbon</span> Dashboard</h1>
   <div class="header-right">
     <a class="method-link" href="/methodology">Methodology</a>
     <a class="method-link" href="https://github.com/boettiger-lab/nimbus-carbon-api" target="_blank">GitHub</a>
@@ -144,13 +150,13 @@
   </div>
 
   <div class="section-head" style="margin-top:1.75rem">
-    <h2>Models</h2>
+    <h2>Models by node</h2>
   </div>
   <div class="cards" id="cards"></div>
 </main>
 
 <footer>
-  Data from nimbus's own Prometheus (DCGM GPU sensors) ·
+  Data from the cluster's own Prometheus (DCGM GPU sensors) ·
   Grid intensity: <a href="https://www.epa.gov/egrid" target="_blank">EPA eGRID 2022</a> ·
   <a href="/methodology">Methodology &amp; References</a> ·
   <a href="https://github.com/boettiger-lab/nimbus-carbon-api" target="_blank">Source on GitHub</a> ·
@@ -283,11 +289,14 @@ function render(data) {
   lastData = data;
   const models = (data.models||[]).slice().sort((a,b)=>b.co2_grams_per_hour-a.co2_grams_per_hour);
 
-  // Brand the page from the node reported by the API (nimbus, cirrus, ...).
-  const nodeName = (models[0] && models[0].node) || 'GPU';
-  document.title = `${nodeName} Carbon Dashboard`;
+  // Brand the page from the nodes the API reports on: a single node keeps its
+  // own name (this image still serves one-node deployments), several become
+  // the cluster view.
+  const nodes = [...new Set(models.map(m => m.node).filter(Boolean))];
+  const title = nodes.length === 1 ? nodes[0] : 'Cluster';
+  document.title = `${title} Carbon Dashboard`;
   const h1 = document.getElementById('page-title');
-  if (h1) h1.innerHTML = `${nodeName} <span>Carbon</span> Dashboard`;
+  if (h1) h1.innerHTML = `${title} <span>Carbon</span> Dashboard`;
 
   const totalPower   = models.reduce((s,m)=>s+m.power_watts,0);
   const totalCO2hr   = models.reduce((s,m)=>s+m.co2_grams_per_hour,0);
@@ -299,7 +308,7 @@ function render(data) {
     <div class="stat"><div class="stat-label">Total Power</div><div class="stat-value">${fmt(totalPower/1000,2)}</div><div class="stat-unit">kilowatts</div></div>
     <div class="stat"><div class="stat-label">CO₂ / hour</div><div class="stat-value">${fmt(totalCO2hr/1000,2)}</div><div class="stat-unit">kg CO₂e</div></div>
     <div class="stat"><div class="stat-label">CO₂ / day</div><div class="stat-value">${fmt(totalCO2hr*24/1000,1)}</div><div class="stat-unit">kg CO₂e</div></div>
-    <div class="stat"><div class="stat-label">Active GPUs</div><div class="stat-value">${totalGPUs}</div><div class="stat-unit">across ${models.length} models</div></div>
+    <div class="stat"><div class="stat-label">Active GPUs</div><div class="stat-value">${totalGPUs}</div><div class="stat-unit">across ${nodes.length} node${nodes.length===1?'':'s'}</div></div>
     <div class="stat"><div class="stat-label">Active Models</div><div class="stat-value">${activeN}</div><div class="stat-unit">generating tokens</div></div>
     <div class="stat"><div class="stat-label">Avg Grid Intensity</div><div class="stat-value">${fmt(avgIntensity,3)}</div><div class="stat-unit">kg CO₂/kWh</div></div>
   `;
@@ -376,12 +385,13 @@ function render(data) {
     <div class="model-row">
     <div class="card">
       <div class="card-header">
-        <div class="model-name ${m.model_name?'':'unknown'}">${m.model_name||m.container}</div>
+        <div class="model-name ${m.model_name?'':'unknown'}"><span class="node-tag">${m.node}</span>${m.model_name||m.container}</div>
         <span class="badge ${active?'badge-active':'badge-idle'}">${active?'active':'idle'}</span>
       </div>
       <div class="card-meta">
         <span>Live</span>
         <span>${m.gpu_count}× ${m.gpu_hardware||'—'}</span>
+        ${m.power_is_node_total ? '<span title="This node&apos;s GPUs are shared with other workloads, so the figure is total node GPU power — an upper bound for this model.">node-total power</span>' : ''}
         ${promptPct != null ? `<span>${fmt(promptPct,0)}% input tokens</span>` : ''}
       </div>
       <div class="metrics">
@@ -410,7 +420,7 @@ function render(data) {
     </div>
     <div class="card avg-card">
       <div class="card-header">
-        <div class="model-name ${m.model_name?'':'unknown'}">${m.model_name||m.container}</div>
+        <div class="model-name ${m.model_name?'':'unknown'}"><span class="node-tag">${m.node}</span>${m.model_name||m.container}</div>
         <span class="badge" style="background:rgba(99,102,241,.15);color:var(--accent)">${hasAvg?`${avgWindow} avg`:'no data yet'}</span>
       </div>
       <div class="card-meta">
@@ -429,7 +439,7 @@ function render(data) {
     </div>
     <div class="card activity-card">
       <div class="card-header">
-        <div class="model-name">${shortModel(m.model_name) || m.container} — Live Activity</div>
+        <div class="model-name"><span class="node-tag">${m.node}</span>${shortModel(m.model_name) || m.container} — Live Activity</div>
       </div>
       <div class="activity-grid">
         <div class="metric"><div class="metric-label">Running</div><div class="metric-value">${fmt(m.num_requests_running,0)}</div><div class="metric-unit">requests</div></div>

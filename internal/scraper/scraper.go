@@ -4,45 +4,13 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/boettiger-lab/nimbus-carbon-api/internal/carbon"
 	"github.com/boettiger-lab/nimbus-carbon-api/internal/prom"
 )
-
-// Config parameterizes the scraper for a specific node. Defaults reproduce
-// the original nimbus behavior exactly (single GB10 in the "default"
-// namespace, per-namespace power attribution), so the same image serves both
-// nimbus and other nodes purely via environment overrides.
-//
-//   - nimbus: one GB10, one vllm pod in "default", DCGM power is already
-//     attributed to that pod's namespace by the pod-resources mapping, so
-//     power is queried per-namespace (NodePower=false).
-//   - cirrus: two RTX 8000s time-sliced across several namespaces
-//     (vllm/jupyter/mcp), so DCGM per-GPU power can't be split per tenant.
-//     Set NodePower=true to attribute TOTAL node GPU power (both cards) to the
-//     vLLM namespace — a deliberate upper bound, documented on the dashboard.
-type Config struct {
-	Namespace   string // vLLM namespace to read token/request metrics from
-	NodeName    string // node display name + DCGM Hostname selector for node-scope power
-	GPUHardware string // display string for the GPU model
-	GPUCount    int    // number of physical GPUs on the node
-	Container   string // serving container name (display only)
-	NodePower   bool   // true => attribute total node GPU power to Namespace (shared-GPU node)
-}
-
-// DefaultConfig returns the original nimbus configuration.
-func DefaultConfig() Config {
-	return Config{
-		Namespace:   "default",
-		NodeName:    "nimbus",
-		GPUHardware: "NVIDIA GB10",
-		GPUCount:    1,
-		Container:   "vllm",
-		NodePower:   false,
-	}
-}
 
 // ModelMetrics holds the latest carbon and performance metrics for the
 // currently-active model.
@@ -233,7 +201,8 @@ func (h *modelHistory) addSample(t time.Time, power, promptTok, genTok, decodeTo
 	}
 }
 
-// Scraper polls Prometheus and maintains in-memory state, keyed by namespace.
+// Scraper polls Prometheus and maintains in-memory state, keyed by NODE name
+// (one row per GPU node in the cluster).
 type Scraper struct {
 	client   *prom.Client
 	interval time.Duration
@@ -249,7 +218,7 @@ func New(promURL string, interval time.Duration) *Scraper {
 	return NewWithConfig(promURL, interval, DefaultConfig())
 }
 
-// NewWithConfig builds a scraper for an arbitrary node.
+// NewWithConfig builds a scraper for an arbitrary set of nodes.
 func NewWithConfig(promURL string, interval time.Duration, cfg Config) *Scraper {
 	return &Scraper{
 		client:   prom.NewClient(promURL, 30*time.Second),
@@ -270,79 +239,57 @@ func (s *Scraper) Run() {
 	}
 }
 
-// powerKey maps a power series' namespace label to the key used for state.
-// In node-power mode every watt is attributed to the configured vLLM
-// namespace (the DCGM series has no meaningful/consistent namespace on a
-// time-sliced GPU), so the power and token histories share one key.
-func (s *Scraper) powerKey(ns string) string {
-	if s.cfg.NodePower {
-		return s.cfg.Namespace
-	}
-	return ns
+// --- query builders -------------------------------------------------------
+//
+// Every vLLM query is filtered by BOTH namespace and node and grouped by both,
+// so a result can be attributed to exactly one configured node. GPU power and
+// utilisation come from DCGM, which labels series with `Hostname` (the node)
+// rather than `node`.
+
+// vllmQuery wraps a vLLM metric expression in the shared node+namespace
+// selector and groups it by (node, namespace) plus any extra labels.
+func (s *Scraper) vllmQuery(expr string, extraGroupBy ...string) string {
+	groupBy := append([]string{"node", "namespace"}, extraGroupBy...)
+	return fmt.Sprintf(`sum by (%s) (%s)`, strings.Join(groupBy, ", "),
+		fmt.Sprintf(expr, s.cfg.vllmSelector()))
 }
 
-// --- query builders (selectors depend on Config) ---
-
-func (s *Scraper) powerInstantQuery() string {
-	if s.cfg.NodePower {
-		return fmt.Sprintf(`sum (avg_over_time(DCGM_FI_DEV_POWER_USAGE{Hostname=%q}[5m]))`, s.cfg.NodeName)
+// powerQueries returns the DCGM power expressions needed for the configured
+// nodes: one grouped by Hostname for total-node attribution, one grouped by
+// (Hostname, namespace) for nodes whose GPUs are read per-tenant. Either may
+// be empty when no node needs it.
+func (s *Scraper) powerQueries(rangeSel string) (nodeScoped, nsScoped string) {
+	npNodes, nsNodes := s.cfg.nodesByPowerMode()
+	if len(npNodes) > 0 {
+		nodeScoped = fmt.Sprintf(`sum by (Hostname) (%s)`,
+			dcgm("DCGM_FI_DEV_POWER_USAGE", alternation(npNodes), rangeSel))
 	}
-	return fmt.Sprintf(`sum by (namespace) (avg_over_time(DCGM_FI_DEV_POWER_USAGE{namespace=%q}[5m]))`, s.cfg.Namespace)
+	if len(nsNodes) > 0 {
+		nsScoped = fmt.Sprintf(`sum by (Hostname, namespace) (%s)`,
+			dcgm("DCGM_FI_DEV_POWER_USAGE", alternation(nsNodes), rangeSel))
+	}
+	return nodeScoped, nsScoped
 }
 
-func (s *Scraper) powerRangeQuery() string {
-	if s.cfg.NodePower {
-		return fmt.Sprintf(`sum (DCGM_FI_DEV_POWER_USAGE{Hostname=%q})`, s.cfg.NodeName)
+// dcgm builds a DCGM selector, optionally smoothed over a range window.
+// rangeSel is "" for an instant read or e.g. "[5m]" for an averaged one.
+func dcgm(metric, hosts, rangeSel string) string {
+	sel := fmt.Sprintf(`%s{Hostname=~%q}`, metric, hosts)
+	if rangeSel == "" {
+		return sel
 	}
-	return fmt.Sprintf(`sum by (namespace) (DCGM_FI_DEV_POWER_USAGE{namespace=%q})`, s.cfg.Namespace)
-}
-
-func (s *Scraper) utilQuery() string {
-	if s.cfg.NodePower {
-		return fmt.Sprintf(`avg (avg_over_time(DCGM_FI_DEV_GPU_UTIL{Hostname=%q}[5m]))`, s.cfg.NodeName)
-	}
-	return fmt.Sprintf(`avg by (namespace) (avg_over_time(DCGM_FI_DEV_GPU_UTIL{namespace=%q}[5m]))`, s.cfg.Namespace)
+	return fmt.Sprintf(`avg_over_time(%s%s)`, sel, rangeSel)
 }
 
 // backfill queries Prometheus for 7 days of historical power and token data
 // and seeds the hourly average buckets so 24h/7d averages are immediately
-// correct after a restart.
+// correct after a restart. Every series is keyed by node, exactly as the live
+// scrape is.
 func (s *Scraper) backfill() {
 	log.Println("scraper: backfilling 7-day averages from Prometheus...")
 	end := time.Now()
 	start := end.Add(-7 * 24 * time.Hour)
 	step := 5 * time.Minute
-	ns := s.cfg.Namespace
-
-	powerSeries, err := s.client.RangeQuery(s.powerRangeQuery(), start, end, step)
-	if err != nil {
-		log.Printf("scraper: backfill power query failed: %v", err)
-		return
-	}
-	promptSeries, err := s.client.RangeQuery(
-		fmt.Sprintf(`sum by (namespace) (rate(vllm:prompt_tokens_total{namespace=%q}[5m]))`, ns),
-		start, end, step,
-	)
-	if err != nil {
-		log.Printf("scraper: backfill prompt token query failed: %v", err)
-		return
-	}
-	genSeries, err := s.client.RangeQuery(
-		fmt.Sprintf(`sum by (namespace) (rate(vllm:generation_tokens_total{namespace=%q}[5m]))`, ns),
-		start, end, step,
-	)
-	if err != nil {
-		log.Printf("scraper: backfill generation token query failed: %v", err)
-		return
-	}
-	latencySeries, err := s.client.RangeQuery(
-		fmt.Sprintf(`sum by (namespace) (rate(vllm:inter_token_latency_seconds_sum{namespace=%q}[5m]))`, ns),
-		start, end, step,
-	)
-	if err != nil {
-		log.Printf("scraper: backfill latency query failed: %v", err)
-		return
-	}
 
 	type sample struct{ power, promptTok, genTok, latencySum float64 }
 	byKeyTime := make(map[string]map[int64]*sample)
@@ -352,45 +299,70 @@ func (s *Scraper) backfill() {
 		}
 		return byKeyTime[key]
 	}
+	add := func(key string, ts int64, f func(*sample)) {
+		m := ensure(key)
+		if m[ts] == nil {
+			m[ts] = &sample{}
+		}
+		f(m[ts])
+	}
 
-	for _, sr := range powerSeries {
-		m := ensure(s.powerKey(sr.Metric["namespace"]))
-		for _, pt := range sr.Points {
-			ts := pt.Time.Unix()
-			if m[ts] == nil {
-				m[ts] = &sample{}
+	// GPU power, from DCGM (Hostname-labelled).
+	nodeScoped, nsScoped := s.powerQueries("")
+	for _, q := range []struct {
+		expr       string
+		byHostOnly bool
+	}{{nodeScoped, true}, {nsScoped, false}} {
+		if q.expr == "" {
+			continue
+		}
+		series, err := s.client.RangeQuery(q.expr, start, end, step)
+		if err != nil {
+			log.Printf("scraper: backfill power query failed: %v", err)
+			return
+		}
+		for _, sr := range series {
+			key := ""
+			if q.byHostOnly {
+				if n := s.cfg.node(sr.Metric["Hostname"]); n != nil {
+					key = n.Name
+				}
+			} else {
+				key = s.cfg.keyFor(sr.Metric["Hostname"], sr.Metric["namespace"])
 			}
-			m[ts].power += pt.Value
+			if key == "" {
+				continue
+			}
+			for _, pt := range sr.Points {
+				add(key, pt.Time.Unix(), func(sm *sample) { sm.power += pt.Value })
+			}
 		}
 	}
-	for _, sr := range promptSeries {
-		m := ensure(sr.Metric["namespace"])
-		for _, pt := range sr.Points {
-			ts := pt.Time.Unix()
-			if m[ts] == nil {
-				m[ts] = &sample{}
-			}
-			m[ts].promptTok += pt.Value
+
+	// vLLM token and latency rates, node+namespace scoped.
+	for _, q := range []struct {
+		expr  string
+		apply func(*sample, float64)
+	}{
+		{s.vllmQuery(`rate(vllm:prompt_tokens_total{%s}[5m])`), func(sm *sample, v float64) { sm.promptTok += v }},
+		{s.vllmQuery(`rate(vllm:generation_tokens_total{%s}[5m])`), func(sm *sample, v float64) { sm.genTok += v }},
+		{s.vllmQuery(`rate(vllm:inter_token_latency_seconds_sum{%s}[5m])`), func(sm *sample, v float64) { sm.latencySum += v }},
+	} {
+		series, err := s.client.RangeQuery(q.expr, start, end, step)
+		if err != nil {
+			log.Printf("scraper: backfill token query failed: %v", err)
+			return
 		}
-	}
-	for _, sr := range genSeries {
-		m := ensure(sr.Metric["namespace"])
-		for _, pt := range sr.Points {
-			ts := pt.Time.Unix()
-			if m[ts] == nil {
-				m[ts] = &sample{}
+		apply := q.apply
+		for _, sr := range series {
+			key := s.cfg.keyFor(sr.Metric["node"], sr.Metric["namespace"])
+			if key == "" {
+				continue
 			}
-			m[ts].genTok += pt.Value
-		}
-	}
-	for _, sr := range latencySeries {
-		m := ensure(sr.Metric["namespace"])
-		for _, pt := range sr.Points {
-			ts := pt.Time.Unix()
-			if m[ts] == nil {
-				m[ts] = &sample{}
+			for _, pt := range sr.Points {
+				value := pt.Value
+				add(key, pt.Time.Unix(), func(sm *sample) { apply(sm, value) })
 			}
-			m[ts].latencySum += pt.Value
 		}
 	}
 
@@ -414,7 +386,7 @@ func (s *Scraper) backfill() {
 		}
 	}
 
-	log.Printf("scraper: backfilled %d key(s) from Prometheus", len(byKeyTime))
+	log.Printf("scraper: backfilled %d node(s) from Prometheus", len(byKeyTime))
 }
 
 // Models returns a snapshot of all current model metrics.
@@ -429,15 +401,42 @@ func (s *Scraper) Models() []*ModelMetrics {
 	return out
 }
 
-// Series returns the history for a namespace/metric combination. container is
-// accepted for API-compatibility with the route but is unused (one container
-// per namespace). metric is one of "power_watts", "co2_grams_per_hour",
+// nodeForNamespace resolves a namespace to the single node serving it, or ""
+// if no node or more than one node matches.
+func (s *Scraper) nodeForNamespace(namespace string) string {
+	match := ""
+	for _, n := range s.cfg.Nodes {
+		if n.Namespace != namespace {
+			continue
+		}
+		if match != "" {
+			return "" // ambiguous: several nodes share the namespace
+		}
+		match = n.Name
+	}
+	return match
+}
+
+// Series returns the history for a node/metric combination. container is
+// accepted for API-compatibility with the route but is unused (one serving
+// container per node). metric is one of "power_watts", "co2_grams_per_hour",
 // "co2_mg_per_token".
-func (s *Scraper) Series(namespace, container, metric string, since time.Duration) [][2]interface{} {
+//
+// State is keyed by node, but the first path segment used to be a namespace,
+// so a namespace is still accepted and resolved to the node serving it — old
+// links keep working as long as the namespace is unambiguous.
+func (s *Scraper) Series(node, container, metric string, since time.Duration) [][2]interface{} {
 	_ = container
 	s.mu.RLock()
-	h, ok := s.history[namespace]
+	h, ok := s.history[node]
 	s.mu.RUnlock()
+	if !ok {
+		if resolved := s.nodeForNamespace(node); resolved != "" {
+			s.mu.RLock()
+			h, ok = s.history[resolved]
+			s.mu.RUnlock()
+		}
+	}
 	if !ok {
 		return nil
 	}
@@ -502,22 +501,25 @@ func (s *Scraper) scrape() {
 		log.Printf("scraper: decode speed query failed: %v", err)
 	}
 
-	keys := make(map[string]struct{})
-	for k := range powerByKey {
-		keys[k] = struct{}{}
-	}
-	for k := range genTokensByKey {
-		keys[k] = struct{}{}
-	}
-	for k := range promptTokensByKey {
-		keys[k] = struct{}{}
-	}
-
+	// One row per configured node, in configured order, so the dashboard's
+	// card order is stable rather than map-iteration order.
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for key := range keys {
+	for i := range s.cfg.Nodes {
+		node := s.cfg.Nodes[i]
+		key := node.Name
+		if _, hasPower := powerByKey[key]; !hasPower {
+			_, hasGen := genTokensByKey[key]
+			_, hasPrompt := promptTokensByKey[key]
+			if !hasGen && !hasPrompt {
+				// Nothing reported for this node at all (exporter down, node
+				// drained). Leave any previous reading in place rather than
+				// overwriting it with zeros.
+				continue
+			}
+		}
 		power := powerByKey[key]
 		intensity := carbon.BerkeleyIntensity
 
@@ -534,11 +536,11 @@ func (s *Scraper) scrape() {
 
 		m := &ModelMetrics{
 			ModelName:              modelName,
-			Namespace:              key,
-			Container:              s.cfg.Container,
-			GPUHardware:            s.cfg.GPUHardware,
-			Node:                   s.cfg.NodeName,
-			GPUCount:               s.cfg.GPUCount,
+			Namespace:              node.Namespace,
+			Container:              node.Container,
+			GPUHardware:            node.GPUHardware,
+			Node:                   node.Name,
+			GPUCount:               node.GPUCount,
 			PowerWatts:             math.Round(power*10) / 10,
 			PromptTokensPerSec:     math.Round(promptTok*10) / 10,
 			GenerationTokensPerSec: math.Round(genTok*10) / 10,
@@ -550,7 +552,7 @@ func (s *Scraper) scrape() {
 			KVCacheUsagePerc:       math.Round(kvCacheByKey[key]*10) / 10,
 			GPUUtilPerc:            math.Round(gpuUtilByKey[key]*10) / 10,
 			RequestsPerHour:        math.Round(requestRateByKey[key]*10) / 10,
-			PowerIsNodeTotal:       s.cfg.NodePower,
+			PowerIsNodeTotal:       node.NodePower,
 			UpdatedAt:              now,
 		}
 		if co2PerToken > 0 {
@@ -692,33 +694,44 @@ func average24h7d(now time.Time, buckets []avgBucket) windowAverages {
 	return out
 }
 
-// queryPower returns GPU power (W) keyed by namespace (or, in node-power mode,
-// total node power under the configured namespace key).
+// queryPower returns GPU power (W) keyed by node name.
 func (s *Scraper) queryPower() (map[string]float64, error) {
-	results, err := s.client.Query(s.powerInstantQuery())
-	if err != nil {
-		return nil, err
-	}
+	nodeScoped, nsScoped := s.powerQueries("[5m]")
 	power := make(map[string]float64)
-	for _, r := range results {
-		power[s.powerKey(r.Metric["namespace"])] += r.Value
+
+	if nodeScoped != "" {
+		results, err := s.client.Query(nodeScoped)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range results {
+			if n := s.cfg.node(r.Metric["Hostname"]); n != nil {
+				power[n.Name] += r.Value
+			}
+		}
+	}
+	if nsScoped != "" {
+		results, err := s.client.Query(nsScoped)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range results {
+			if key := s.cfg.keyFor(r.Metric["Hostname"], r.Metric["namespace"]); key != "" {
+				power[key] += r.Value
+			}
+		}
 	}
 	return power, nil
 }
 
 // queryTokens returns 2-minute prompt and generation token rates keyed by
-// namespace, plus the vLLM model_name label.
+// node, plus the vLLM model_name label.
 func (s *Scraper) queryTokens() (genTokens, promptTokens map[string]float64, names map[string]string, err error) {
-	ns := s.cfg.Namespace
-	genResults, err := s.client.Query(
-		fmt.Sprintf(`sum by (namespace, model_name) (rate(vllm:generation_tokens_total{namespace=%q}[2m]))`, ns),
-	)
+	genResults, err := s.client.Query(s.vllmQuery(`rate(vllm:generation_tokens_total{%s}[2m])`, "model_name"))
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	promptResults, err := s.client.Query(
-		fmt.Sprintf(`sum by (namespace, model_name) (rate(vllm:prompt_tokens_total{namespace=%q}[2m]))`, ns),
-	)
+	promptResults, err := s.client.Query(s.vllmQuery(`rate(vllm:prompt_tokens_total{%s}[2m])`, "model_name"))
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -726,88 +739,107 @@ func (s *Scraper) queryTokens() (genTokens, promptTokens map[string]float64, nam
 	genTokens = make(map[string]float64)
 	promptTokens = make(map[string]float64)
 	names = make(map[string]string)
-	for _, r := range genResults {
-		key := r.Metric["namespace"]
-		genTokens[key] += r.Value
-		if names[key] == "" {
-			names[key] = r.Metric["model_name"]
+	collect := func(results []prom.Result, into map[string]float64) {
+		for _, r := range results {
+			key := s.cfg.keyFor(r.Metric["node"], r.Metric["namespace"])
+			if key == "" {
+				continue
+			}
+			into[key] += r.Value
+			if names[key] == "" {
+				names[key] = r.Metric["model_name"]
+			}
 		}
 	}
-	for _, r := range promptResults {
-		key := r.Metric["namespace"]
-		promptTokens[key] += r.Value
-		if names[key] == "" {
-			names[key] = r.Metric["model_name"]
-		}
-	}
+	collect(genResults, genTokens)
+	collect(promptResults, promptTokens)
 	return genTokens, promptTokens, names, nil
 }
 
-// queryRequestStats returns vLLM's live engine-state gauges keyed by namespace.
+// queryRequestStats returns vLLM's live engine-state gauges keyed by node.
 func (s *Scraper) queryRequestStats() (running, waiting, kvCache map[string]float64, err error) {
-	ns := s.cfg.Namespace
-	runResults, err := s.client.Query(fmt.Sprintf(`sum by (namespace) (vllm:num_requests_running{namespace=%q})`, ns))
+	runResults, err := s.client.Query(s.vllmQuery(`vllm:num_requests_running{%s}`))
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	waitResults, err := s.client.Query(fmt.Sprintf(`sum by (namespace) (vllm:num_requests_waiting{namespace=%q})`, ns))
+	waitResults, err := s.client.Query(s.vllmQuery(`vllm:num_requests_waiting{%s}`))
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	kvResults, err := s.client.Query(fmt.Sprintf(`avg by (namespace) (vllm:kv_cache_usage_perc{namespace=%q}) * 100`, ns))
+	// avg (not sum) across engines, then scaled to a percentage.
+	kvResults, err := s.client.Query(
+		fmt.Sprintf(`avg by (node, namespace) (vllm:kv_cache_usage_perc{%s}) * 100`, s.cfg.vllmSelector()),
+	)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	running = make(map[string]float64)
-	waiting = make(map[string]float64)
-	kvCache = make(map[string]float64)
-	for _, r := range runResults {
-		running[r.Metric["namespace"]] = r.Value
-	}
-	for _, r := range waitResults {
-		waiting[r.Metric["namespace"]] = r.Value
-	}
-	for _, r := range kvResults {
-		kvCache[r.Metric["namespace"]] = r.Value
-	}
+	running = s.byNode(runResults)
+	waiting = s.byNode(waitResults)
+	kvCache = s.byNode(kvResults)
 	return running, waiting, kvCache, nil
 }
 
-// queryGPUUtil returns average GPU compute utilization (%), attributed to the
-// configured namespace key (node-wide in node-power mode).
-func (s *Scraper) queryGPUUtil() (map[string]float64, error) {
-	results, err := s.client.Query(s.utilQuery())
-	if err != nil {
-		return nil, err
-	}
-	util := make(map[string]float64)
+// byNode reduces query results labelled with (node, namespace) to a map keyed
+// by node name, dropping anything no configured node claims.
+func (s *Scraper) byNode(results []prom.Result) map[string]float64 {
+	out := make(map[string]float64, len(results))
 	for _, r := range results {
-		util[s.powerKey(r.Metric["namespace"])] = r.Value
+		if key := s.cfg.keyFor(r.Metric["node"], r.Metric["namespace"]); key != "" {
+			out[key] += r.Value
+		}
+	}
+	return out
+}
+
+// queryGPUUtil returns average GPU compute utilization (%) keyed by node.
+func (s *Scraper) queryGPUUtil() (map[string]float64, error) {
+	npNodes, nsNodes := s.cfg.nodesByPowerMode()
+	util := make(map[string]float64)
+
+	if len(npNodes) > 0 {
+		results, err := s.client.Query(fmt.Sprintf(`avg by (Hostname) (%s)`,
+			dcgm("DCGM_FI_DEV_GPU_UTIL", alternation(npNodes), "[5m]")))
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range results {
+			if n := s.cfg.node(r.Metric["Hostname"]); n != nil {
+				util[n.Name] = r.Value
+			}
+		}
+	}
+	if len(nsNodes) > 0 {
+		results, err := s.client.Query(fmt.Sprintf(`avg by (Hostname, namespace) (%s)`,
+			dcgm("DCGM_FI_DEV_GPU_UTIL", alternation(nsNodes), "[5m]")))
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range results {
+			if key := s.cfg.keyFor(r.Metric["Hostname"], r.Metric["namespace"]); key != "" {
+				util[key] = r.Value
+			}
+		}
 	}
 	return util, nil
 }
 
-// queryRequestRate returns completed requests per hour keyed by namespace.
+// queryRequestRate returns completed requests per hour keyed by node.
 func (s *Scraper) queryRequestRate() (map[string]float64, error) {
 	results, err := s.client.Query(
-		fmt.Sprintf(`sum by (namespace) (rate(vllm:request_success_total{namespace=%q}[15m])) * 3600`, s.cfg.Namespace),
+		fmt.Sprintf(`%s * 3600`, s.vllmQuery(`rate(vllm:request_success_total{%s}[15m])`)),
 	)
 	if err != nil {
 		return nil, err
 	}
-	rate := make(map[string]float64)
-	for _, r := range results {
-		rate[r.Metric["namespace"]] = r.Value
-	}
-	return rate, nil
+	return s.byNode(results), nil
 }
 
 // queryDecodeSpeed returns the actual generation speed (output tokens/sec
-// while generating) keyed by namespace: total generation tokens divided by
-// total time actually spent generating, over a 2-minute window. This excludes
-// idle gaps between requests and reflects the true per-token decode rate
-// (e.g. ~138 tok/s) rather than a wall-clock utilization average.
+// while generating) keyed by node: total generation tokens divided by total
+// time actually spent generating, over a 2-minute window. This excludes idle
+// gaps between requests and reflects the true per-token decode rate (e.g.
+// ~138 tok/s) rather than a wall-clock utilization average.
 //
 //	decode tok/s = rate(vllm:generation_tokens_total) / rate(vllm:inter_token_latency_seconds_sum)
 //
@@ -819,14 +851,13 @@ func (s *Scraper) queryRequestRate() (map[string]float64, error) {
 // speculative tokens counts all 3), unlike inter_token_latency_count which
 // records one sample per step and would undercount ~3x. Numerator and
 // denominator scale together with load, so the ratio is stable even when the
-// window is only partly busy. Fully-idle namespaces give 0/0 -> NaN
-// (filtered), so they're simply absent.
+// window is only partly busy. Fully-idle nodes give 0/0 -> NaN (filtered), so
+// they're simply absent.
 func (s *Scraper) queryDecodeSpeed() (map[string]float64, error) {
-	ns := s.cfg.Namespace
-	results, err := s.client.Query(
-		fmt.Sprintf(`sum by (namespace) (rate(vllm:generation_tokens_total{namespace=%q}[2m]))
-			/ sum by (namespace) (rate(vllm:inter_token_latency_seconds_sum{namespace=%q}[2m]))`, ns, ns),
-	)
+	results, err := s.client.Query(fmt.Sprintf("%s\n\t\t\t/ %s",
+		s.vllmQuery(`rate(vllm:generation_tokens_total{%s}[2m])`),
+		s.vllmQuery(`rate(vllm:inter_token_latency_seconds_sum{%s}[2m])`),
+	))
 	if err != nil {
 		return nil, err
 	}
@@ -835,27 +866,24 @@ func (s *Scraper) queryDecodeSpeed() (map[string]float64, error) {
 		if math.IsNaN(r.Value) || math.IsInf(r.Value, 0) {
 			continue
 		}
-		speed[r.Metric["namespace"]] = r.Value
+		if key := s.cfg.keyFor(r.Metric["node"], r.Metric["namespace"]); key != "" {
+			speed[key] = r.Value
+		}
 	}
 	return speed, nil
 }
 
 // queryMTPAcceptance returns the speculative-decoding (MTP) draft-token
-// acceptance rate (%) keyed by namespace.
+// acceptance rate (%) keyed by node.
 func (s *Scraper) queryMTPAcceptance() (map[string]float64, error) {
-	ns := s.cfg.Namespace
-	results, err := s.client.Query(
-		fmt.Sprintf(`100 * sum by (namespace) (rate(vllm:spec_decode_num_accepted_tokens_total{namespace=%q}[15m]))
-			/ sum by (namespace) (rate(vllm:spec_decode_num_draft_tokens_total{namespace=%q}[15m]))`, ns, ns),
-	)
+	results, err := s.client.Query(fmt.Sprintf("100 * %s\n\t\t\t/ %s",
+		s.vllmQuery(`rate(vllm:spec_decode_num_accepted_tokens_total{%s}[15m])`),
+		s.vllmQuery(`rate(vllm:spec_decode_num_draft_tokens_total{%s}[15m])`),
+	))
 	if err != nil {
 		return nil, err
 	}
-	rate := make(map[string]float64)
-	for _, r := range results {
-		rate[r.Metric["namespace"]] = r.Value
-	}
-	return rate, nil
+	return s.byNode(results), nil
 }
 
 // ClusterTimePoint is one time-step of aggregated cluster-wide carbon data.
@@ -866,19 +894,28 @@ type ClusterTimePoint struct {
 	CO2MgPerToken   float64 `json:"co2_mg_per_token,omitempty"`
 }
 
-// ClusterTimeSeries queries Prometheus for historical power + token data and
-// returns aggregated totals per time step, using the fixed Berkeley intensity.
+// ClusterTimeSeries queries Prometheus for historical power + token data
+// across EVERY configured node and returns cluster totals per time step,
+// using the fixed Berkeley intensity.
 func (s *Scraper) ClusterTimeSeries(rangeBack, step time.Duration) ([]ClusterTimePoint, error) {
 	end := time.Now()
 	start := end.Add(-rangeBack)
-	ns := s.cfg.Namespace
 
-	powerSeries, err := s.client.RangeQuery(s.powerRangeQuery(), start, end, step)
-	if err != nil {
-		return nil, err
+	var powerSeries []prom.RangeSeries
+	nodeScoped, nsScoped := s.powerQueries("")
+	for _, expr := range []string{nodeScoped, nsScoped} {
+		if expr == "" {
+			continue
+		}
+		series, err := s.client.RangeQuery(expr, start, end, step)
+		if err != nil {
+			return nil, err
+		}
+		powerSeries = append(powerSeries, series...)
 	}
+
 	tokenSeries, err := s.client.RangeQuery(
-		fmt.Sprintf(`sum by (namespace) (rate(vllm:generation_tokens_total{namespace=%q}[5m]) + rate(vllm:prompt_tokens_total{namespace=%q}[5m]))`, ns, ns),
+		s.vllmQuery(`rate(vllm:generation_tokens_total{%[1]s}[5m]) + rate(vllm:prompt_tokens_total{%[1]s}[5m])`),
 		start, end, step,
 	)
 	if err != nil {

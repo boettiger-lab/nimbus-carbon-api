@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Methodology — nimbus Carbon Dashboard</title>
+<title>Methodology — Cluster Carbon Dashboard</title>
 <style>
   :root { --bg:#0f1117; --surface:#1a1d27; --border:#2a2d3a; --text:#e2e8f0; --muted:#64748b; --accent:#6366f1; --green:#22c55e; }
   * { box-sizing:border-box; margin:0; padding:0; }
@@ -34,17 +34,19 @@
 <body>
 <header>
   <a href="/">← Dashboard</a>
-  <h1>nimbus <span>Carbon</span> — Methodology</h1>
+  <h1>Cluster <span>Carbon</span> — Methodology</h1>
 </header>
 <main>
 
 <h2>Overview</h2>
 <p>
   This dashboard estimates the carbon footprint of large language model (LLM) inference
-  running on <code>nimbus</code>, a single GB10 DGX Spark node
-  (<a href="https://github.com/boettiger-lab/k8s/tree/main/vllm/nimbus" target="_blank">boettiger-lab/k8s/vllm/nimbus</a>).
-  All measurements are derived passively from existing telemetry — no instrumentation of
-  the LLM service is required.
+  running on the lab's Kubernetes cluster
+  (<a href="https://github.com/boettiger-lab/k8s" target="_blank">boettiger-lab/k8s</a>) —
+  one row per GPU node serving a model. Today that is <code>cirrus</code> (two Quadro
+  RTX 8000s, shared with other GPU workloads) and <code>nimbus</code> (one GB10 DGX
+  Spark). All measurements are derived passively from existing telemetry — no
+  instrumentation of the LLM service is required.
 </p>
 
 <div class="callout">
@@ -57,23 +59,32 @@
 <p>
   GPU power draw is read from
   <a href="https://github.com/NVIDIA/dcgm-exporter" target="_blank">NVIDIA DCGM Exporter</a>
-  (<em>Data Center GPU Manager</em>), which runs on nimbus's single GPU (a GB10). DCGM
+  (<em>Data Center GPU Manager</em>), which runs on every GPU node in the cluster. DCGM
   reads the hardware power sensor via NVML (<code>nvmlDeviceGetPowerUsage</code>) and
   exports it to Prometheus as:
 </p>
-<pre><code>DCGM_FI_DEV_POWER_USAGE{namespace, container, pod, ...}  # watts, one GPU</code></pre>
+<pre><code>DCGM_FI_DEV_POWER_USAGE{Hostname, namespace, pod, ...}  # watts, one series per GPU</code></pre>
 <p>
-  nimbus has exactly one physical GPU, so no summing across GPUs is needed — just a
-  namespace filter:
+  Power is summed per <strong>node</strong> — across both of cirrus's cards, and across
+  nimbus's single one:
 </p>
-<pre><code>sum by (namespace) (
-  avg_over_time(DCGM_FI_DEV_POWER_USAGE{namespace="default"}[5m])
+<pre><code>sum by (Hostname) (
+  avg_over_time(DCGM_FI_DEV_POWER_USAGE{Hostname=~"cirrus|nimbus"}[5m])
 )</code></pre>
 <p>
   The <code>avg_over_time(...[5m])</code> wrapper smooths short-lived spikes into a 5-minute
-  rolling average. This gives total GPU power in <strong>watts</strong> for each deployed model.
+  rolling average. This gives total GPU power in <strong>watts</strong> per node.
   Measurements are scraped every 30 seconds.
 </p>
+<div class="callout">
+  <p><strong>Shared GPUs are reported as an upper bound.</strong> DCGM attributes each
+  GPU's watts to whichever pod the pod-resources mapping picked, which cannot be split
+  fairly when a card is time-sliced across several tenants — and on nimbus it names an
+  unrelated pod entirely. So on any node whose GPUs are shared, the dashboard reports
+  <em>total node GPU power</em> and attributes it to the model, marking the card
+  <code>node-total power</code> (<code>power_is_node_total</code> in the API). The
+  model's own draw is somewhere below that number, never above it.</p>
+</div>
 <div class="callout">
   <p><strong>Limitation:</strong> We measure <em>GPU power only</em>. CPU, RAM, storage, and
   networking power are not included. For GPU-heavy inference workloads this typically
@@ -88,16 +99,23 @@
   tracked separately and summed into a total token rate:
 </p>
 <pre><code>-- Output (decode) tokens generated per second (2-minute window --
--- short enough to track nimbus's bursty single-user traffic without
+-- short enough to track our bursty single-user traffic without
 -- diluting a burst across mostly-idle time on either side of it):
-sum by (namespace, model_name) (
-  rate(vllm:generation_tokens_total{namespace="default"}[2m])
+sum by (node, namespace, model_name) (
+  rate(vllm:generation_tokens_total{namespace=~"vllm",node=~"cirrus|nimbus"}[2m])
 )
 
 -- Input (prefill) tokens processed per second:
-sum by (namespace, model_name) (
-  rate(vllm:prompt_tokens_total{namespace="default"}[2m])
+sum by (node, namespace, model_name) (
+  rate(vllm:prompt_tokens_total{namespace=~"vllm",node=~"cirrus|nimbus"}[2m])
 )</code></pre>
+<div class="callout">
+  <p><strong>Why the <code>node</code> filter matters:</strong> both models currently run
+  in the same <code>vllm</code> namespace. Grouping by namespace alone would sum one
+  node's tokens into the other's row while its watts stayed node-scoped, understating
+  CO₂ per token. Every vLLM query here is filtered and grouped by node <em>and</em>
+  namespace.</p>
+</div>
 <p>
   Both phases consume GPU energy: the <strong>prefill</strong> phase runs attention over
   every input token before the first output token is produced; the <strong>decode</strong>
@@ -161,7 +179,7 @@ sum by (namespace, model_name) (
 
 <h2>Step 3 — Carbon Intensity</h2>
 <p>
-  nimbus is one machine in one place: Berkeley, CA. Grid carbon intensity is therefore a
+  Every node is in one place: Berkeley, CA. Grid carbon intensity is therefore a
   fixed constant rather than a lookup table — the
   <a href="https://www.epa.gov/egrid" target="_blank">EPA eGRID 2022</a> average for the
   CAMX subregion (California):
@@ -194,14 +212,14 @@ CO₂_mg/token = P_watts × intensity_kg/kWh × (1e6 mg/kg) / (3.6e6 J/kWh) / to
 <h3>Commercial frontier comparison — per-model physics estimate</h3>
 <p>
   Rather than comparing against a fixed hypothetical workload, the dashboard computes
-  a <strong>per-model, apples-to-apples power comparison</strong>: for each nimbus model's
+  a <strong>per-model, apples-to-apples power comparison</strong>: for each of our models'
   actual observed token throughput (prompt and generation rates), what total power would
   a commercial frontier model draw to serve the same tokens at the same rate?
 </p>
 <div class="callout">
   <p><strong>Key principle:</strong> The comparison holds everything fixed except model
   size — same tokens, same traffic level, <strong>same grid</strong>. The frontier model's
-  CO₂/token is computed using the same grid carbon intensity as the nimbus model it's compared
+  CO₂/token is computed using the same grid carbon intensity as the model it's compared
   against. This isolates the model size/energy tradeoff: a larger frontier model may produce
   higher-quality output, but requires substantially more hardware — and therefore more
   energy — to host and run. Because grid intensity is the same on both sides, the CO₂ ratio
@@ -239,7 +257,7 @@ CO₂_mg/token = P_watts × intensity_kg/kWh × (1e6 mg/kg) / (3.6e6 J/kWh) / to
 <table>
   <tr><th>Phase</th><th>Marginal energy</th><th>Derivation</th></tr>
   <tr><td>Prefill (input tokens)</td><td>0.5 J/token</td><td>Compute-bound: 600 GFLOPS/token, 24× H100 at 60% util → 23,700 tok/s; additional power (700−225)×24 = 11,400 W → 0.48 J/tok</td></tr>
-  <tr><td>Decode (output tokens)</td><td>6 J/token</td><td>Memory-bandwidth-bound at low batch (B≈1–4, matching nimbus traffic): must load 300 GB active weights per step; 80.4 TB/s → 270 tok/s; ~3,000 W additional → ~11 J at B=1, ~4 J at B=4</td></tr>
+  <tr><td>Decode (output tokens)</td><td>6 J/token</td><td>Memory-bandwidth-bound at low batch (B≈1–4, matching our traffic): must load 300 GB active weights per step; 80.4 TB/s → 270 tok/s; ~3,000 W additional → ~11 J at B=1, ~4 J at B=4</td></tr>
 </table>
 
 <h3>Per-model comparison formula</h3>
@@ -249,7 +267,7 @@ CO₂_mg/token = P_watts × intensity_kg/kWh × (1e6 mg/kg) / (3.6e6 J/kWh) / to
 
 ratio = frontier_watts / nrp_measured_watts</code></pre>
 <p>
-  This formula is applied to each nimbus model using its <strong>actual observed</strong>
+  This formula is applied to each of our models using its <strong>actual observed</strong>
   prompt and generation token rates. The comparison is shown as a plain-text watts bar on
   each model card, visible only while the model is actively generating (24h-avg combined
   tok/s above a small threshold) — not as a colored verdict, and separate from the
@@ -280,7 +298,7 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
   being poorly managed.</p>
 </div>
 <div class="callout">
-  <p><strong>What this doesn't measure:</strong> nimbus figures are GPU power only (no CPU,
+  <p><strong>What this doesn't measure:</strong> our figures are GPU power only (no CPU,
   DRAM, PUE). Applying a typical 1.5–2× system-overhead correction to both sides would
   preserve the ratio. Commercial cloud PUE (~1.1–1.3) vs. research facility PUE may
   differ slightly but does not change the order-of-magnitude comparison.</p>
@@ -303,22 +321,20 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
   <li><strong>Model card "N× less energy" metric:</strong> Shown only while actively
   generating. Each model card shows how many times more power the commercial frontier
   would require to serve the same tokens (e.g. "7.0× less energy"). This is
-  <code>frontier_watts / nimbus_measured_watts</code>. There is no color judgment on this
+  <code>frontier_watts / measured_watts</code>. There is no color judgment on this
   number — it's informational, not a verdict.</li>
   <li><strong>Power comparison bar (per card):</strong> Shown only while actively
-  generating. A horizontal bar comparing nimbus measured watts against the frontier
+  generating. A horizontal bar comparing the node's measured watts against the frontier
   equivalent (purple band), with a breakdown of idle floor vs. marginal power.</li>
 </ul>
 <p>
   CO₂/token and J/token are both plain per-model card stats, not chart bars — a number
   (with a 24h average alongside where available), or <code>—</code> when there isn't
   enough throughput to make the ratio meaningful. Neither is colored by a comparative
-  scale: nimbus almost always runs exactly one active model at a time (it's a
-  single-GPU personal box, not a multi-tenant cluster), so any chart comparing bars
-  <em>against each other</em> would only ever have one bar — and coloring a lone bar by
-  its own maximum always renders it at the most "extreme" color, regardless of the
-  actual value. A comparison visualization's entire reason to exist is comparing
-  multiple things; with one thing, it can only produce a misleading result.
+  scale: each node runs one active model at a time, and the handful of models on the
+  page are different sizes on different hardware, so coloring them against each other
+  would rank the GB10 against a pair of RTX 8000s as though that were a verdict.
+  Comparing them is left to the reader, with the node and its GPUs named on every card.
 </p>
 
 <h3>Energy per token (J/token)</h3>
@@ -398,14 +414,14 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
   The backend's timeseries endpoint queries the Prometheus range API at
   adaptive resolution (5-minute steps for 24 h, hourly for 7 d, 6-hourly for
   30 d) and returns <code>co2_grams_per_hour</code> at each step (already
-  computed server-side as <code>power_watts × 0.198</code>, nimbus's fixed
+  computed server-side as <code>power_watts × 0.198</code>, our fixed
   grid intensity). The dashboard then integrates that rate client-side using
   the rectangle rule, running-summed over the selected window:
 </p>
 <pre><code>total_g = Σ (co2_grams_per_hour_i × step_hours)</code></pre>
 <p>
   This total only grows — it never resets within a window — so the chart
-  climbs steadily even while nimbus is mostly idle, rather than looking flat
+  climbs steadily even while the cluster is mostly idle, rather than looking flat
   or empty the way a tiny, nearly-constant rate does.
 </p>
 
@@ -415,13 +431,13 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
   <li>Datacenter PUE (Power Usage Effectiveness) is not applied (adds 10–50%)</li>
   <li>Carbon intensity values are annual averages; real-time grid mix varies hour-to-hour</li>
   <li>DCGM reports a single power reading per GPU; we cannot decompose energy into prefill vs
-    decode phases on the nimbus side</li>
+    decode phases on our side</li>
   <li>The commercial frontier model spec is an informed estimate, not a known architecture.
     No empirical per-token energy measurement exists for GPT-4, Claude 3/3.5/3.7, or Gemini 1.5/2.
     The closest empirical anchor is Google's production measurement of 0.24 Wh/prompt for Gemini
     Apps (arXiv:2508.15734). Our physics-based estimate is broadly consistent with this and with
     independent bottom-up estimates (0.34 Wh median, arXiv:2509.20241)</li>
-  <li>Decode marginal energy (6 J/token) assumes low batch matching typical nimbus traffic;
+  <li>Decode marginal energy (6 J/token) assumes low batch matching our typical traffic;
     commercial providers batching hundreds of concurrent requests achieve lower per-token
     decode costs, but also require the same or greater hosting floor</li>
   <li>Agentic energy amplification is highly framework-dependent: measured research-grade
@@ -432,7 +448,7 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
     resets on every pod restart, backfilled only from Prometheus's own ~2-day retention.
     Persistent storage across restarts is a possible future improvement, not yet implemented</li>
   <li>Request latency (p50/p99 via <code>histogram_quantile</code>) is deliberately not
-    shown. nimbus's traffic is bursty single-user generation — over a short window there
+    shown. Our traffic is bursty single-user generation — over a short window there
     are often only one or two completed requests, and a quantile computed from that few
     samples is not a meaningful percentile, just one or two data points dressed up as
     statistics (the same structural problem that led to dropping the old CO₂/token
@@ -535,7 +551,7 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
   <tr><th>Reference</th><th>Conversion factor</th><th>Source</th></tr>
   <tr><td>Miles driven (gas car)</td><td>404 g CO₂/mile</td><td><a href="https://www.epa.gov/greenvehicles/greenhouse-gas-emissions-typical-passenger-vehicle" target="_blank">EPA, average passenger vehicle</a></td></tr>
   <tr><td>Smartphone charges</td><td>8.22 g CO₂/charge</td><td>Commonly cited estimate (a full charge is roughly 0.012 kWh)</td></tr>
-  <tr><td>Refrigerator runtime</td><td>~150 W average draw</td><td>Typical household refrigerator; converted to grams using nimbus's own 0.198 kg CO₂/kWh grid intensity, for a like-for-like "same grid, different appliance" comparison</td></tr>
+  <tr><td>Refrigerator runtime</td><td>~150 W average draw</td><td>Typical household refrigerator; converted to grams using our own 0.198 kg CO₂/kWh grid intensity, for a like-for-like "same grid, different appliance" comparison</td></tr>
   <tr><td>Tree-months of absorption</td><td>~1.75 kg CO₂/month/tree</td><td>Common carbon-calculator estimate — the roughest of the four; real absorption varies significantly by species, age, and region</td></tr>
 </table>
 <div class="callout">
@@ -555,7 +571,7 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
 
 </main>
 <footer>
-  nimbus Carbon Dashboard · <a href="/">Back to Dashboard</a>
+  Cluster Carbon Dashboard · <a href="/">Back to Dashboard</a>
 </footer>
 </body>
 </html>

@@ -1,23 +1,43 @@
+# Example deployment. The LIVE manifest for the lab cluster lives in
+# boettiger-lab/k8s at platform/monitoring/carbon-api.yaml (namespace
+# `monitoring`, ingress + TLS + the real node list); this file is the
+# self-contained minimum for anyone deploying the service elsewhere.
+#
+# One deployment covers a whole cluster: list every GPU node in nodes.json.
+# Both `name` (node) and `namespace` are matched on each vLLM query, so nodes
+# sharing a namespace do not contaminate each other's numbers. Set
+# node_power: true on any node whose GPUs are shared with other workloads --
+# it reports total node GPU power as an explicit upper bound.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: carbon-api-nodes
+data:
+  nodes.json: |
+    [
+      {"name": "nimbus", "namespace": "vllm", "gpu_hardware": "NVIDIA GB10",
+       "gpu_count": 1, "node_power": true}
+    ]
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: nimbus-carbon-api
-  namespace: default
+  name: carbon-api
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: nimbus-carbon-api
+      app: carbon-api
   template:
     metadata:
       labels:
-        app: nimbus-carbon-api
+        app: carbon-api
     spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
       containers:
-        - name: nimbus-carbon-api
+        - name: carbon-api
           image: ghcr.io/boettiger-lab/nimbus-carbon-api:latest
           imagePullPolicy: Always
           ports:
@@ -29,56 +49,37 @@ spec:
               value: "30s"
             - name: LISTEN_ADDR
               value: ":8080"
+            - name: NODES_FILE
+              value: /etc/carbon-api/nodes.json
+          volumeMounts:
+            - name: nodes
+              mountPath: /etc/carbon-api
+              readOnly: true
           resources:
             requests:
               cpu: "100m"
               memory: "128Mi"
             limits:
               cpu: "100m"
-              memory: "128Mi"
+              memory: "256Mi"
           livenessProbe:
             httpGet:
               path: /healthz
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 30
+      volumes:
+        - name: nodes
+          configMap:
+            name: carbon-api-nodes
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: nimbus-carbon-api
-  namespace: default
+  name: carbon-api
 spec:
   selector:
-    app: nimbus-carbon-api
+    app: carbon-api
   ports:
     - port: 80
       targetPort: 8080
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: nimbus-carbon-api
-  namespace: default
-  annotations:
-    cert-manager.io/cluster-issuer: letsencrypt-production
-    external-dns.alpha.kubernetes.io/cloudflare-proxied: "false"
-  labels:
-    app: nimbus-carbon-api
-spec:
-  ingressClassName: traefik
-  rules:
-  - host: carbon-nimbus.carlboettiger.info
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: nimbus-carbon-api
-            port:
-              number: 80
-  tls:
-  - hosts:
-    - carbon-nimbus.carlboettiger.info
-    secretName: nimbus-carbon-api-tls
