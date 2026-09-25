@@ -5,18 +5,26 @@ import (
 	"testing"
 )
 
-func twoNodeConfig() Config {
-	return Config{Nodes: []NodeConfig{
-		{Name: "cirrus", Namespace: "vllm", GPUHardware: "Quadro RTX 8000", GPUCount: 2, Container: "vllm", NodePower: true},
-		{Name: "nimbus", Namespace: "vllm", GPUHardware: "NVIDIA GB10", GPUCount: 1, Container: "vllm", NodePower: true},
-	}}
+// clusterConfig mirrors the live cluster: a TP2 pair whose worker (nimbus4)
+// exports no vLLM metrics of its own but draws power.
+func clusterConfig() Config {
+	nodes, err := ParseNodes(`[
+	  {"name":"cirrus","gpu_hardware":"Quadro RTX 8000","gpu_count":2},
+	  {"name":"nimbus","gpu_hardware":"NVIDIA GB10"},
+	  {"name":"nimbus2","gpu_hardware":"NVIDIA GB10","gpu_count":2,"power_hosts":["nimbus2","nimbus4"]},
+	  {"name":"nimbus3","gpu_hardware":"NVIDIA GB10"}
+	]`)
+	if err != nil {
+		panic(err)
+	}
+	return Config{Nodes: nodes}
 }
 
 // TestKeyForRequiresBothLabels is the regression test for the misattribution
 // bug: two nodes served models out of the SAME namespace, so keying state by
 // namespace alone summed nimbus's tokens into cirrus's row.
 func TestKeyForRequiresBothLabels(t *testing.T) {
-	c := twoNodeConfig()
+	c := clusterConfig()
 
 	if got := c.keyFor("cirrus", "vllm"); got != "cirrus" {
 		t.Errorf("keyFor(cirrus, vllm) = %q, want cirrus", got)
@@ -34,10 +42,10 @@ func TestKeyForRequiresBothLabels(t *testing.T) {
 	}
 }
 
-// TestVLLMSelectorFiltersNodes guards the selector both nodes' queries share.
+// TestVLLMSelectorFiltersNodes guards the selector every query shares.
 func TestVLLMSelectorFiltersNodes(t *testing.T) {
-	sel := twoNodeConfig().vllmSelector()
-	if !strings.Contains(sel, `node=~"cirrus|nimbus"`) {
+	sel := clusterConfig().vllmSelector()
+	if !strings.Contains(sel, `node=~"cirrus|nimbus|nimbus2|nimbus3"`) {
 		t.Errorf("selector missing node filter: %s", sel)
 	}
 	if !strings.Contains(sel, `namespace=~"vllm"`) {
@@ -45,40 +53,60 @@ func TestVLLMSelectorFiltersNodes(t *testing.T) {
 	}
 }
 
-// TestVLLMQueryGroupsByNode: without `node` in the by-clause the two nodes
-// collapse back into one series, which is the bug in a different disguise.
-func TestVLLMQueryGroupsByNode(t *testing.T) {
-	s := NewWithConfig("http://prometheus", 0, twoNodeConfig())
-	q := s.vllmQuery(`rate(vllm:generation_tokens_total{%s}[2m])`, "model_name")
+// TestVLLMQueryGroupsPerModel: without node AND model_name in the by-clause,
+// two models (or two nodes) collapse into one series.
+func TestVLLMQueryGroupsPerModel(t *testing.T) {
+	q := clusterConfig().vllm(`rate(vllm:generation_tokens_total{%s}[2m])`)
 	if !strings.HasPrefix(q, "sum by (node, namespace, model_name)") {
-		t.Errorf("query does not group by node: %s", q)
+		t.Errorf("query does not group per model: %s", q)
 	}
-	if !strings.Contains(q, `node=~"cirrus|nimbus"`) {
+	if !strings.Contains(q, `node=~"cirrus|nimbus|nimbus2|nimbus3"`) {
 		t.Errorf("query does not filter by node: %s", q)
 	}
 }
 
-// TestPowerQueriesSplitByMode: node-power nodes are read by DCGM Hostname,
-// namespace-attributed nodes by (Hostname, namespace).
-func TestPowerQueriesSplitByMode(t *testing.T) {
-	c := twoNodeConfig()
-	c.Nodes = append(c.Nodes, NodeConfig{Name: "thelio", Namespace: "vllm", GPUCount: 1, NodePower: false})
-	s := NewWithConfig("http://prometheus", 0, c)
+// TestPowerFoldsTPWorkerIntoHead: the TP2 worker's watts must be relabelled to
+// the head's node, or DeepSeek's energy is half what it really is.
+func TestPowerFoldsTPWorkerIntoHead(t *testing.T) {
+	q := clusterConfig().dcgmByNode("DCGM_FI_DEV_POWER_USAGE", "sum", "5m")
+	if !strings.Contains(q, `Hostname=~"cirrus|nimbus|nimbus2|nimbus4|nimbus3"`) {
+		t.Errorf("power query does not read every power host: %s", q)
+	}
+	if !strings.Contains(q, `"node", "nimbus2", "Hostname", "nimbus4"`) {
+		t.Errorf("worker power not relabelled to the head: %s", q)
+	}
+	if !strings.HasPrefix(q, "sum by (node)") || !strings.Contains(q, "avg_over_time") {
+		t.Errorf("power query shape wrong: %s", q)
+	}
+	if raw := clusterConfig().dcgmByNode("DCGM_FI_DEV_POWER_USAGE", "sum", ""); strings.Contains(raw, "avg_over_time") {
+		t.Errorf("unsmoothed power query should not wrap avg_over_time: %s", raw)
+	}
+}
 
-	nodeScoped, nsScoped := s.powerQueries("[5m]")
-	if !strings.Contains(nodeScoped, `sum by (Hostname)`) || !strings.Contains(nodeScoped, `Hostname=~"cirrus|nimbus"`) {
-		t.Errorf("node-scoped power query wrong: %s", nodeScoped)
+// TestAttributedPowerJoinsOnNode: node power only counts toward a model while
+// that model is serving, and the join must keep the model's labels.
+func TestAttributedPowerJoinsOnNode(t *testing.T) {
+	c := clusterConfig()
+	q := c.attributedPower("", c.presence())
+	if !strings.Contains(q, "* on (node) group_right ()") {
+		t.Errorf("attribution join wrong: %s", q)
 	}
-	if !strings.Contains(nsScoped, `sum by (Hostname, namespace)`) || !strings.Contains(nsScoped, `Hostname=~"thelio"`) {
-		t.Errorf("namespace-scoped power query wrong: %s", nsScoped)
+	if !strings.Contains(q, "vllm:num_requests_running") {
+		t.Errorf("attribution not keyed on the serving gauge: %s", q)
 	}
-	if !strings.Contains(nodeScoped, "avg_over_time") {
-		t.Errorf("instant power query should smooth over the window: %s", nodeScoped)
+}
+
+// TestActiveIndicatorIsParenthesised: spliced into the attribution join
+// unparenthesised, "x * 0 + 1" makes the whole product 1 — active energy
+// then reads as 1 W forever. (Shipped once; caught against live data.)
+func TestActiveIndicatorIsParenthesised(t *testing.T) {
+	a := clusterConfig().active()
+	if !strings.HasPrefix(a, "(") || !strings.HasSuffix(a, "* 0 + 1)") {
+		t.Errorf("active() must be fully parenthesised: %s", a)
 	}
-	// An empty range selector means a raw range query (backfill / timeseries).
-	raw, _ := s.powerQueries("")
-	if strings.Contains(raw, "avg_over_time") {
-		t.Errorf("range power query should not wrap avg_over_time: %s", raw)
+	p := clusterConfig().presence()
+	if !strings.HasPrefix(p, "(") || !strings.HasSuffix(p, "* 0 + 1)") {
+		t.Errorf("presence() must be fully parenthesised: %s", p)
 	}
 }
 
@@ -88,8 +116,12 @@ func TestParseNodesDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseNodes: %v", err)
 	}
-	if nodes[0].Namespace != "vllm" || nodes[0].Container != "vllm" {
-		t.Errorf("defaults not applied: %+v", nodes[0])
+	n := nodes[0]
+	if n.Namespace != "vllm" || n.Container != "vllm" {
+		t.Errorf("defaults not applied: %+v", n)
+	}
+	if len(n.PowerHosts) != 1 || n.PowerHosts[0] != "cirrus" {
+		t.Errorf("power_hosts should default to the node itself: %+v", n.PowerHosts)
 	}
 	if _, err := ParseNodes(`[]`); err == nil {
 		t.Error("expected an error for an empty node list")
@@ -99,17 +131,25 @@ func TestParseNodesDefaults(t *testing.T) {
 	}
 }
 
-// TestNodeForNamespaceAmbiguity: the legacy /api/v1/carbon/{namespace}/...
-// route may only resolve when exactly one node serves that namespace.
-func TestNodeForNamespace(t *testing.T) {
-	single := NewWithConfig("http://prometheus", 0, Config{Nodes: []NodeConfig{
-		{Name: "cirrus", Namespace: "vllm"},
-	}})
-	if got := single.nodeForNamespace("vllm"); got != "cirrus" {
-		t.Errorf("nodeForNamespace(vllm) = %q, want cirrus", got)
+// TestParseNodesRejectsDoubleClaim: one host's watts counted for two nodes
+// would double-count its energy.
+func TestParseNodesRejectsDoubleClaim(t *testing.T) {
+	_, err := ParseNodes(`[{"name":"nimbus2","power_hosts":["nimbus2","nimbus4"]},{"name":"nimbus4"}]`)
+	if err == nil {
+		t.Error("expected an error when two nodes claim nimbus4's power")
 	}
-	shared := NewWithConfig("http://prometheus", 0, twoNodeConfig())
-	if got := shared.nodeForNamespace("vllm"); got != "" {
-		t.Errorf("nodeForNamespace(vllm) = %q, want empty (ambiguous)", got)
+}
+
+// TestModelInfoPrefersNodeSpecific: "model@node" beats a bare model name.
+func TestModelInfoPrefersNodeSpecific(t *testing.T) {
+	c := Config{Models: map[string]ModelInfo{
+		"qwen":        {DisplayName: "Qwen generic"},
+		"qwen@nimbus": {DisplayName: "Qwen3.8-Flash-Next"},
+	}}
+	if got := c.info("qwen", "nimbus").DisplayName; got != "Qwen3.8-Flash-Next" {
+		t.Errorf("info(qwen, nimbus) = %q", got)
+	}
+	if got := c.info("qwen", "cirrus").DisplayName; got != "Qwen generic" {
+		t.Errorf("info(qwen, cirrus) = %q", got)
 	}
 }
