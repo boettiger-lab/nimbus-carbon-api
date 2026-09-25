@@ -2,8 +2,9 @@
 
 A lightweight Go service that estimates the carbon footprint of LLM inference
 across the GPU nodes of the lab's Kubernetes cluster
-(see [boettiger-lab/k8s](https://github.com/boettiger-lab/k8s)) — one row per
-node, one deployment for the whole cluster.
+(see [boettiger-lab/k8s](https://github.com/boettiger-lab/k8s)) — one card per
+served model, live or aggregated over 24 h / 7 d / 15 d, one deployment for the
+whole cluster.
 
 Named for `nimbus`, the GB10 DGX Spark it was originally written for; it now
 also covers `cirrus` (2× Quadro RTX 8000) and any other node listed in its
@@ -12,7 +13,7 @@ config.
 Based on [nrp-carbon-api](https://github.com/boettiger-lab/nrp-carbon-api)
 (carbon tracking for the shared NRP Nautilus cluster), adapted for a handful of
 machines in one building: no multi-institution grid-intensity lookup — one grid
-location (Berkeley, CA / CAMX), and whichever model each node currently serves.
+location (Berkeley, CA / CAMX).
 
 ## Configuration
 
@@ -21,50 +22,60 @@ named by `NODES_FILE` (a mounted ConfigMap on the cluster):
 
 ```json
 [
-  {"name": "cirrus", "namespace": "vllm", "gpu_hardware": "Quadro RTX 8000",
-   "gpu_count": 2, "node_power": true},
-  {"name": "nimbus", "namespace": "vllm", "gpu_hardware": "NVIDIA GB10",
-   "gpu_count": 1, "node_power": true}
+  {"name": "cirrus",  "gpu_hardware": "Quadro RTX 8000", "gpu_count": 2},
+  {"name": "nimbus",  "gpu_hardware": "NVIDIA GB10"},
+  {"name": "nimbus2", "gpu_hardware": "NVIDIA GB10", "gpu_count": 2,
+   "power_hosts": ["nimbus2", "nimbus4"]}
 ]
 ```
 
 | Field | Meaning |
 |---|---|
-| `name` | Kubernetes node name — matched against the `node` label on vLLM metrics and DCGM's `Hostname` |
+| `name` | Kubernetes node name — matched against the `node` label on vLLM metrics |
 | `namespace` | namespace the vLLM workload runs in (default `vllm`) |
-| `gpu_hardware`, `gpu_count` | display strings for the card |
+| `gpu_hardware`, `gpu_count` | display strings for the card; for a multi-node model, the total |
+| `power_hosts` | DCGM `Hostname`s whose power belongs to models served from this node (default `[name]`). List every rank of a tensor-parallel model: only the head exports vLLM metrics, but every rank draws power. A host may be claimed by one node only |
 | `container` | serving container name, display only (default `vllm`) |
-| `node_power` | attribute TOTAL node GPU power to this model — an upper bound, flagged as `power_is_node_total` |
 
-**Both `name` and `namespace` are matched on every vLLM query.** Namespace alone
-is not enough: cirrus and nimbus both serve out of the `vllm` namespace, so a
-namespace-only query sums one node's tokens into the other's row while the power
-stays node-scoped, quietly understating CO2 per token.
+`node_power` from older configs is accepted and ignored: power is **always** the
+node total, attributed to a model only while that model is serving there. DCGM's
+per-pod attribution is not usable here — it names whichever pod the
+pod-resources mapping picked (on nimbus, an MCP pod in `default`).
 
-Set `node_power` whenever a node's GPUs are shared with anything else. It is
-also the only mode that works when DCGM's pod-resources mapping attributes a GPU
-to some other tenant — on nimbus the GB10's watts are reported under an MCP pod
-in `default`, not under vLLM, so a namespace-scoped power query there returns
-nothing at all.
+**Both `name` and `namespace` are matched on every vLLM query.** Every model
+serves out of the `vllm` namespace, so a namespace-only query would sum one
+node's tokens into another's.
+
+Optional display names come from `MODELS_FILE`, keyed by served model name, or
+`model@node` when a name is reused on two nodes:
+
+```json
+{"qwen@nimbus": {"display_name": "Qwen3.8-Flash-Next NVFP4",
+                 "description": "MoE, MTP speculative decoding"}}
+```
 
 The legacy single-node environment variables (`NODE_NAME`, `NAMESPACE`,
-`GPU_HARDWARE`, `GPU_COUNT`, `CONTAINER`, `NODE_POWER`) still describe exactly
-one node and continue to work.
+`GPU_HARDWARE`, `GPU_COUNT`, `CONTAINER`) still describe exactly one node.
 
 ## How it works
 
-1. **GPU power** is read from [NVIDIA DCGM Exporter](https://github.com/NVIDIA/dcgm-exporter)
-   metrics, collected by the cluster's Prometheus
-   (see [boettiger-lab/k8s/platform/monitoring](https://github.com/boettiger-lab/k8s/tree/main/platform/monitoring)),
-   summed per node.
-2. **Token throughput** is read from vLLM's built-in Prometheus metrics.
-3. **Grid carbon intensity** is a fixed constant for Berkeley, CA (CAMX
+1. **Models** are discovered from vLLM's own metrics: anything exporting
+   `vllm:num_requests_running` on a configured node is a model, keyed
+   `model_name@node`. Nothing is listed by hand, and a model scaled to zero
+   keeps its card for as long as Prometheus (15 days here) retains its series.
+2. **GPU power** comes from [NVIDIA DCGM Exporter](https://github.com/NVIDIA/dcgm-exporter),
+   summed per node over its `power_hosts`, and joined onto whichever model is
+   serving on that node at each minute. GPU time spent serving no model stays
+   out of every total.
+3. **Tokens, latency and engine state** come from vLLM's Prometheus metrics:
+   token counters, TTFT / end-to-end / queue-time histograms (percentiles
+   withheld below 20 requests), KV-cache and prefix-cache use, and
+   speculative-decoding acceptance.
+4. **Grid carbon intensity** is a fixed constant for Berkeley, CA (CAMX
    eGRID 2022 subregion, 0.198 kg CO2/kWh) — see `internal/carbon/intensity.go`.
-4. **Live engine activity** — running/queued requests, KV cache usage, GPU
-   utilization, request throughput, and speculative-decoding (MTP)
-   acceptance rate — is read directly from vLLM's and DCGM's own Prometheus
-   gauges (not derived from carbon math) and shown on a companion "Live
-   Activity" card next to each model's carbon card.
+5. **Everything is computed from Prometheus** — live state every 30 s,
+   aggregates every 5 min — so the service holds no history and a restart
+   loses nothing.
 
 Carbon = Energy × Grid Intensity. See the
 [Methodology](https://carbon.carlboettiger.info/methodology) page for
@@ -74,7 +85,7 @@ full details.
 
 ```bash
 export PROMETHEUS_URL=http://localhost:9090   # kubectl -n monitoring port-forward svc/prometheus-server 9090:80
-export NODES_JSON='[{"name":"cirrus","namespace":"vllm","gpu_count":2,"node_power":true}]'
+export NODES_JSON='[{"name":"nimbus","gpu_hardware":"NVIDIA GB10"}]'
 go run ./cmd
 # → http://localhost:8080
 ```
@@ -103,9 +114,8 @@ docker push ghcr.io/boettiger-lab/nimbus-carbon-api:latest
 
 | Endpoint | Description |
 |---|---|
-| `GET /api/v1/carbon` | Current metrics, one entry per configured node |
-| `GET /api/v1/carbon/timeseries?range=24h\|7d\|30d` | Cluster-wide CO2 and power time series (all nodes summed) |
-| `GET /api/v1/carbon/{node}/{container}/{metric}?range=...` | Per-node time series (`power_watts`, `co2_grams_per_hour`, `co2_mg_per_token`) — useful for comparing models tried over time on the same hardware. A namespace is still accepted in place of the node when only one node serves it |
+| `GET /api/v1/models` | One record per model: `status` (`generating`/`idle`/`offline`), `live` (null when offline), `aggregates` per window, `availability` strip per window, first/last seen. `/api/v1/carbon` is an alias |
+| `GET /api/v1/carbon/timeseries?range=24h\|7d\|15d` | Cluster-wide LLM power and CO2 over time (attributed power only) |
 | `GET /healthz` | Health check |
 
 ## License

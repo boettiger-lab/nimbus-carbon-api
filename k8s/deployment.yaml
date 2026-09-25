@@ -3,11 +3,11 @@
 # `monitoring`, ingress + TLS + the real node list); this file is the
 # self-contained minimum for anyone deploying the service elsewhere.
 #
-# One deployment covers a whole cluster: list every GPU node in nodes.json.
-# Both `name` (node) and `namespace` are matched on each vLLM query, so nodes
-# sharing a namespace do not contaminate each other's numbers. Set
-# node_power: true on any node whose GPUs are shared with other workloads --
-# it reports total node GPU power as an explicit upper bound.
+# One deployment covers a whole cluster: list every GPU node that serves models
+# in nodes.json. Models themselves are discovered from vLLM's metrics. Both
+# `name` (node) and `namespace` are matched on each vLLM query, so nodes
+# sharing a namespace do not contaminate each other's numbers. A
+# tensor-parallel model lists every rank's host in `power_hosts`.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -16,7 +16,7 @@ data:
   nodes.json: |
     [
       {"name": "nimbus", "namespace": "vllm", "gpu_hardware": "NVIDIA GB10",
-       "gpu_count": 1, "node_power": true}
+       "gpu_count": 1}
     ]
 ---
 apiVersion: apps/v1

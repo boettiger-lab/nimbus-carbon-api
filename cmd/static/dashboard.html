@@ -3,580 +3,563 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Cluster Carbon Dashboard</title>
+<title>LLM Carbon Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <style>
   :root {
-    --bg:#0f1117; --surface:#1a1d27; --border:#2a2d3a;
-    --text:#e2e8f0; --muted:#64748b;
-    --green:#22c55e; --yellow:#eab308; --orange:#f97316; --red:#ef4444;
-    --blue:#3b82f6; --accent:#6366f1;
+    color-scheme: light;
+    --page:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink-2:#52514e; --muted:#898781;
+    --grid:#e1e0d9; --axis:#c3c2b7; --border:rgba(11,11,11,0.10);
+    --accent:#2a78d6; --accent-wash:rgba(42,120,214,.10);
+    --good:#0ca30c;
+    /* availability strip: ordinal blue ramp, "not serving" is the gridline */
+    --strip-0:#e1e0d9; --strip-1:#86b6ef; --strip-2:#1c5cab;
   }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page:#0d0d0d; --surface:#1a1a19; --ink:#ffffff; --ink-2:#c3c2b7; --muted:#898781;
+      --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
+      --accent:#3987e5; --accent-wash:rgba(57,135,229,.16);
+      --strip-0:#2c2c2a; --strip-1:#184f95; --strip-2:#5598e7;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:#0d0d0d; --surface:#1a1a19; --ink:#ffffff; --ink-2:#c3c2b7; --muted:#898781;
+    --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
+    --accent:#3987e5; --accent-wash:rgba(57,135,229,.16);
+    --strip-0:#2c2c2a; --strip-1:#184f95; --strip-2:#5598e7;
+  }
+
   *{box-sizing:border-box;margin:0;padding:0;}
-  body{background:var(--bg);color:var(--text);font-family:system-ui,sans-serif;min-height:100vh;}
+  body{background:var(--page);color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;min-height:100vh;line-height:1.4;}
+  a{color:inherit;}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em;}
 
-  header{padding:1.1rem 2rem;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;}
-  header h1{font-size:1.05rem;font-weight:600;letter-spacing:.02em;white-space:nowrap;}
-  header h1 span{color:var(--accent);}
-  .header-right{display:flex;align-items:center;gap:1rem;}
+  header{padding:1rem 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:.75rem;flex-wrap:wrap;max-width:1400px;margin:0 auto;}
+  header h1{font-size:1.05rem;font-weight:600;}
+  .header-right{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;}
+  .link-btn,.icon-btn{font:inherit;font-size:.75rem;color:var(--ink-2);text-decoration:none;border:1px solid var(--border);border-radius:6px;padding:.3rem .65rem;background:transparent;cursor:pointer;}
+  .link-btn:hover,.icon-btn:hover{color:var(--ink);border-color:var(--axis);}
   #status{font-size:.75rem;color:var(--muted);}
-  #status.ok::before{content:"● ";color:var(--green);}
-  #status.err::before{content:"● ";color:var(--red);}
-  header a.method-link{font-size:.75rem;color:var(--muted);text-decoration:none;border:1px solid var(--border);border-radius:4px;padding:.25rem .6rem;}
-  header a.method-link:hover{color:var(--text);border-color:var(--muted);}
 
-  main{padding:1.5rem 2rem;max-width:1400px;margin:0 auto;}
+  main{padding:1.25rem 16px 2rem;max-width:1400px;margin:0 auto;}
 
-  .summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.85rem;margin-bottom:1.75rem;}
-  .stat{background:var(--surface);border:1px solid var(--border);border-radius:.75rem;padding:.9rem 1.1rem;}
-  .stat-label{font-size:.67rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:.35rem;}
-  .stat-value{font-size:1.5rem;font-weight:700;line-height:1;}
-  .stat-unit{font-size:.7rem;color:var(--muted);margin-top:.2rem;}
+  /* Controls: one row above everything they filter */
+  .controls{display:flex;gap:.75rem 1.25rem;align-items:center;flex-wrap:wrap;margin-bottom:1rem;}
+  .seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;padding:2px;background:var(--surface);}
+  .seg button{font:inherit;font-size:.8rem;border:0;background:transparent;color:var(--ink-2);padding:.35rem .8rem;border-radius:6px;cursor:pointer;}
+  .seg button[aria-pressed="true"]{background:var(--accent-wash);color:var(--ink);font-weight:600;}
+  .seg button:focus-visible,.icon-btn:focus-visible,.link-btn:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+  .controls-label{font-size:.72rem;color:var(--muted);margin-right:.35rem;}
+  .controls-note{font-size:.75rem;color:var(--muted);flex:1 1 260px;}
 
-  .section-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:.85rem;flex-wrap:wrap;gap:.5rem;}
-  .section-head h2{font-size:.78rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;}
+  /* Summary tiles */
+  .summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.75rem;margin-bottom:1.5rem;}
+  .tile{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:.8rem 1rem;}
+  .tile-label{font-size:.75rem;color:var(--ink-2);margin-bottom:.25rem;}
+  .tile-value{font-size:1.5rem;font-weight:600;line-height:1.1;}
+  .tile-unit{font-size:.72rem;color:var(--muted);margin-top:.15rem;}
 
-  .range-tabs{display:flex;gap:.35rem;}
-  .range-tab{font-size:.72rem;padding:.25rem .65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s;}
-  .range-tab:hover{color:var(--text);border-color:var(--muted);}
-  .range-tab.active{background:var(--accent);border-color:var(--accent);color:#fff;}
+  .section-head{display:flex;align-items:baseline;justify-content:space-between;gap:.5rem;flex-wrap:wrap;margin:0 0 .75rem;}
+  .section-head h2{font-size:.9rem;font-weight:600;}
+  .section-head p{font-size:.75rem;color:var(--muted);}
 
-  .chart-wrap{background:var(--surface);border:1px solid var(--border);border-radius:.75rem;padding:1.2rem;margin-bottom:1.75rem;}
+  /* One card per model */
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,360px),1fr));gap:1rem;margin-bottom:2rem;}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1rem 1.1rem;display:flex;flex-direction:column;gap:.8rem;min-width:0;}
+  .card.offline{opacity:.92;}
+  .card-top{display:flex;justify-content:space-between;align-items:flex-start;gap:.6rem;}
+  .card-title{font-size:1rem;font-weight:600;line-height:1.25;overflow-wrap:anywhere;}
+  .card-sub{font-size:.75rem;color:var(--ink-2);margin-top:.15rem;overflow-wrap:anywhere;}
+  .card-desc{font-size:.75rem;color:var(--muted);margin-top:.25rem;}
+
+  .pill{display:inline-flex;align-items:center;gap:.35rem;font-size:.72rem;font-weight:600;white-space:nowrap;padding:.2rem .55rem;border-radius:999px;border:1px solid var(--border);color:var(--ink-2);}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex-shrink:0;}
+  .pill.generating .dot{background:var(--good);}
+  .pill.offline .dot{background:transparent;border:1.5px solid var(--muted);}
+
+  .source{font-size:.72rem;color:var(--muted);border-left:2px solid var(--accent);padding-left:.5rem;}
+  .source.fallback{border-left-color:var(--axis);}
+
+  .carbon{display:grid;grid-template-columns:repeat(3,1fr);gap:.5rem;}
+  .carbon .m{background:var(--accent-wash);border-radius:8px;padding:.55rem .65rem;min-width:0;}
+  .m-label{font-size:.68rem;color:var(--ink-2);}
+  .m-value{font-size:1.15rem;font-weight:600;line-height:1.2;}
+  .m-unit{font-size:.66rem;color:var(--muted);}
+  .carbon-extra{font-size:.72rem;color:var(--ink-2);margin-top:-.35rem;}
+
+  .perf{display:grid;grid-template-columns:1fr 1fr;gap:.1rem 1rem;font-size:.8rem;}
+  .perf div{display:flex;justify-content:space-between;gap:.5rem;padding:.28rem 0;border-bottom:1px solid var(--grid);min-width:0;}
+  .perf dt{color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .perf dd{font-weight:600;white-space:nowrap;font-variant-numeric:tabular-nums;}
+  .perf dd.na{color:var(--muted);font-weight:400;}
+
+  .strip-wrap{display:flex;flex-direction:column;gap:.3rem;}
+  .strip-head{display:flex;justify-content:space-between;font-size:.7rem;color:var(--muted);}
+  .strip{display:flex;gap:1px;height:18px;}
+  .strip span{flex:1;border-radius:2px;background:var(--strip-0);min-width:1px;}
+  .strip span[data-s="1"]{background:var(--strip-1);}
+  .strip span[data-s="2"]{background:var(--strip-2);}
+  .strip span:hover{outline:1px solid var(--ink);outline-offset:0;}
+  .legend{display:flex;gap:.8rem;flex-wrap:wrap;font-size:.7rem;color:var(--ink-2);}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:.3rem;vertical-align:-1px;}
+
+  .card-foot{font-size:.72rem;color:var(--muted);display:flex;justify-content:space-between;gap:.5rem;flex-wrap:wrap;}
+
+  .chart-wrap{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:1.5rem;}
   .chart-wrap canvas{max-height:240px;}
-  .ref-frames{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:.65rem;margin-top:1rem;}
+  .ref-frames{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:.6rem;margin-top:1rem;}
 
-.cards{display:flex;flex-direction:column;gap:.9rem;}
-  .model-row{display:flex;flex-wrap:wrap;gap:.9rem;align-items:flex-start;}
-  .card{background:var(--surface);border:1px solid var(--border);border-radius:.75rem;padding:1.1rem;border-left:3px solid var(--border);flex:1 1 340px;max-width:640px;}
-  .avg-card{border-left-color:var(--accent);}
-  .activity-card{flex:1 1 280px;max-width:420px;}
-  .card-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:.65rem;}
-  .model-name{font-size:.83rem;font-weight:600;line-height:1.3;word-break:break-all;}
-  .model-name.unknown{color:var(--muted);font-style:italic;}
-  .badge{font-size:.63rem;padding:.18rem .45rem;border-radius:999px;white-space:nowrap;margin-left:.4rem;flex-shrink:0;font-weight:600;}
-  .badge-active{background:rgba(34,197,94,.15);color:var(--green);}
-  .badge-idle  {background:rgba(100,116,139,.15);color:var(--muted);}
-  .card-meta{font-size:.7rem;color:var(--muted);margin-bottom:.85rem;}
-  .card-meta span+span::before{content:" · ";}
-  .metrics{display:grid;grid-template-columns:1fr 1fr;gap:.5rem;}
-  .metric{background:rgba(255,255,255,.03);border-radius:.45rem;padding:.55rem .7rem;}
-  .metric-label{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:.15rem;}
-  .metric-value{font-size:1rem;font-weight:700;}
-  .metric-unit{font-size:.62rem;color:var(--muted);}
-  .metric-value.green {color:var(--green);}
-  .metric-value.yellow{color:var(--yellow);}
-  .metric-value.orange{color:var(--orange);}
-  .metric-value.red   {color:var(--red);}
-  /* Grid intensity bar */
-  .grid-intensity{margin-top:.65rem;padding-top:.65rem;border-top:1px solid var(--border);}
-  .grid-intensity-header{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:.4rem;font-size:.68rem;}
-  .grid-location{color:var(--muted);}
-  .grid-value{font-weight:600;font-size:.72rem;}
-  .grid-track{position:relative;height:8px;background:rgba(255,255,255,.06);border-radius:4px;overflow:visible;margin-bottom:.3rem;}
-  body.light .grid-track{background:rgba(0,0,0,.07);}
-  /* gradient fill behind the track: clean green → coal red */
-  .grid-track-fill{position:absolute;inset:0;border-radius:4px;
-    background:linear-gradient(to right,#22c55e 0%,#eab308 35%,#f97316 60%,#ef4444 100%);
-    opacity:.18;}
-  body.light .grid-track-fill{opacity:.25;}
-  /* node marker */
-  .grid-marker{position:absolute;top:-3px;width:3px;height:14px;border-radius:2px;transform:translateX(-50%);}
-  /* US average reference tick */
-  .grid-avg-tick{position:absolute;top:-4px;width:1px;height:16px;background:var(--muted);opacity:.5;transform:translateX(-50%);}
-  .grid-legend{display:flex;justify-content:space-between;font-size:.6rem;color:var(--muted);}
+  .empty{font-size:.85rem;color:var(--muted);padding:1rem 0;}
 
-  /* CO₂/token comparison bar embedded in card */
-  .token-cmp{margin-top:.65rem;padding-top:.65rem;border-top:1px solid var(--border);}
-  .token-cmp-label{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:.45rem;}
-  .token-cmp-track{position:relative;height:18px;background:rgba(255,255,255,.04);border-radius:3px;overflow:visible;}
-  /* shaded band for commercial estimate range */
-  .token-cmp-band{position:absolute;top:0;height:100%;background:rgba(99,102,241,.15);border-radius:3px;}
-  /* nimbus measured bar */
-  .token-cmp-bar{position:absolute;top:2px;height:14px;border-radius:2px;transition:width .4s;}
-  /* commercial midpoint tick */
-  .token-cmp-tick{position:absolute;top:-3px;width:2px;height:24px;background:#6366f1;border-radius:1px;}
-  .token-cmp-legend{display:flex;justify-content:space-between;margin-top:.35rem;font-size:.65rem;color:var(--muted);}
-  .token-cmp-ratio{font-size:.72rem;margin-top:.3rem;font-weight:600;color:var(--text);}
+  #tip{position:fixed;pointer-events:none;z-index:10;background:var(--surface);color:var(--ink);border:1px solid var(--border);border-radius:6px;padding:.35rem .55rem;font-size:.72rem;box-shadow:0 2px 8px rgba(0,0,0,.15);display:none;max-width:260px;}
 
-  /* Live engine activity card (running/waiting requests, KV cache, GPU util) */
-  .activity-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(85px,1fr));gap:.5rem;}
-
-  footer{text-align:center;padding:2rem;font-size:.71rem;color:var(--muted);}
-  footer a{color:var(--muted);}
-
-  /* Light mode overrides */
-  body.light {
-    --bg:#f8fafc; --surface:#ffffff; --border:#e2e8f0;
-    --text:#1e293b; --muted:#64748b;
-  }
-  body.light .metric{background:rgba(0,0,0,.03);}
-  body.light .token-cmp-track{background:rgba(0,0,0,.04);}
-
-  /* Node badge on every card: with more than one node on the page, the model
-     name alone no longer says which machine you are looking at. */
-  .node-tag{display:inline-block;margin-right:.4rem;padding:.05rem .35rem;border-radius:3px;
-    background:rgba(99,102,241,.15);color:var(--accent);font-size:.68rem;font-weight:600;
-    letter-spacing:.03em;text-transform:uppercase;vertical-align:middle;}
-
-  #theme-btn{font-size:.72rem;padding:.25rem .65rem;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s;}
-  #theme-btn:hover{color:var(--text);border-color:var(--muted);}
+  footer{text-align:center;padding:1.5rem 16px 2rem;font-size:.72rem;color:var(--muted);}
 </style>
 </head>
 <body>
 <header>
-  <h1 id="page-title">Cluster <span>Carbon</span> Dashboard</h1>
+  <h1>LLM carbon &amp; performance</h1>
   <div class="header-right">
-    <a class="method-link" href="/methodology">Methodology</a>
-    <a class="method-link" href="https://github.com/boettiger-lab/nimbus-carbon-api" target="_blank">GitHub</a>
-    <button id="theme-btn" onclick="toggleTheme()">Light</button>
-    <span id="status">loading…</span>
+    <a class="link-btn" href="/methodology">Methodology</a>
+    <a class="link-btn" href="https://github.com/boettiger-lab/nimbus-carbon-api" target="_blank" rel="noopener">GitHub</a>
+    <button class="icon-btn" id="theme-btn" type="button" aria-label="Toggle colour theme">Theme: auto</button>
+    <span id="status" role="status">loading…</span>
   </div>
 </header>
 
 <main>
+  <div class="controls">
+    <div>
+      <span class="controls-label" id="mode-label">View</span>
+      <div class="seg" id="mode-seg" role="group" aria-labelledby="mode-label">
+        <button type="button" data-mode="live">Live</button>
+        <button type="button" data-mode="aggregate">Aggregate</button>
+      </div>
+    </div>
+    <div>
+      <span class="controls-label" id="win-label">Window</span>
+      <div class="seg" id="win-seg" role="group" aria-labelledby="win-label"></div>
+    </div>
+    <p class="controls-note" id="controls-note"></p>
+  </div>
+
   <div class="summary" id="summary"></div>
+
+  <div class="section-head">
+    <h2>Models</h2>
+    <p>One card per served model. Power is node GPU power while the model is serving; a tensor-parallel model sums every node it spans.</p>
+  </div>
+  <div class="cards" id="cards"><p class="empty">Loading…</p></div>
 
   <div class="chart-wrap">
     <div class="section-head">
-      <h2>Cluster CO₂ emissions over time</h2>
-      <div class="range-tabs" id="time-range-tabs">
-        <button class="range-tab" data-range="24h">24 h</button>
-        <button class="range-tab active" data-range="7d">7 d</button>
-        <button class="range-tab" data-range="30d">30 d</button>
-      </div>
+      <h2 id="chart-title">Cumulative LLM CO₂</h2>
+      <p id="chart-total"></p>
     </div>
-    <canvas id="lineChart"></canvas>
+    <canvas id="lineChart" aria-label="Cumulative CO2 emitted by LLM serving over the selected window"></canvas>
     <div class="ref-frames" id="ref-frames"></div>
   </div>
-
-  <div class="section-head" style="margin-top:1.75rem">
-    <h2>Models by node</h2>
-  </div>
-  <div class="cards" id="cards"></div>
 </main>
 
+<div id="tip" role="tooltip"></div>
+
 <footer>
-  Data from the cluster's own Prometheus (DCGM GPU sensors) ·
-  Grid intensity: <a href="https://www.epa.gov/egrid" target="_blank">EPA eGRID 2022</a> ·
-  <a href="/methodology">Methodology &amp; References</a> ·
-  <a href="https://github.com/boettiger-lab/nimbus-carbon-api" target="_blank">Source on GitHub</a> ·
-  Refreshes every 30 s
+  Data from the cluster's own Prometheus (vLLM metrics and DCGM GPU power) ·
+  grid intensity: <a href="https://www.epa.gov/egrid" target="_blank" rel="noopener">EPA eGRID 2022</a>, CAMX ·
+  <a href="/methodology">Methodology &amp; references</a> · live data refreshes every 30 s, aggregates every 5 min
 </footer>
 
 <script>
-const API    = '/api/v1/carbon';
+const API = '/api/v1/models';
 const TS_API = '/api/v1/carbon/timeseries';
-let lineChart = null;
-let currentRange = '7d';
-let lastData = null;
-let lastEmissionsTotalGrams = 0;
 
-function chartColors() {
-  const light = document.body.classList.contains('light');
-  return {
-    grid:   light ? '#e2e8f0' : '#2a2d3a',
-    tick:   light ? '#64748b' : '#64748b',
-    legend: light ? '#334155' : '#94a3b8',
-  };
+// ---- persisted view state (URL hash wins, then localStorage) --------------
+function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+function recall(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+const hash = new URLSearchParams(location.hash.slice(1));
+let mode = hash.get('mode') || recall('carbon.mode') || 'live';
+let win = hash.get('window') || recall('carbon.window') || '7d';
+let data = null, lineChart = null;
+
+function saveView() {
+  store('carbon.mode', mode); store('carbon.window', win);
+  history.replaceState(null, '', `#mode=${mode}&window=${win}`);
 }
 
-function applyChartTheme() {
-  const c = chartColors();
-  [lineChart].forEach(ch => {
-    if (!ch) return;
-    Object.values(ch.options.scales).forEach(s => {
-      if (s.grid)  s.grid.color   = c.grid;
-      if (s.ticks) s.ticks.color  = c.tick;
-      if (s.title) s.title.color  = c.tick;
-    });
-    if (ch.options.plugins.legend?.labels) ch.options.plugins.legend.labels.color = c.legend;
-    if (ch.options.plugins.title) ch.options.plugins.title.color = c.tick;
-    ch.update('none');
-  });
+// ---- theme: auto -> light -> dark ----------------------------------------
+const themeBtn = document.getElementById('theme-btn');
+function applyTheme(t) {
+  if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+  else delete document.documentElement.dataset.theme;
+  themeBtn.textContent = 'Theme: ' + (t || 'auto');
+  if (lineChart) styleChart();
 }
+let theme = recall('carbon.theme') || '';
+applyTheme(theme);
+themeBtn.addEventListener('click', () => {
+  theme = theme === '' ? 'light' : theme === 'light' ? 'dark' : '';
+  store('carbon.theme', theme);
+  applyTheme(theme);
+});
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (lineChart) styleChart(); });
 
-function toggleTheme() {
-  const isLight = document.body.classList.toggle('light');
-  localStorage.setItem('theme', isLight ? 'light' : 'dark');
-  document.getElementById('theme-btn').textContent = isLight ? 'Dark' : 'Light';
-  applyChartTheme();
+// ---- formatting ------------------------------------------------------------
+const NA = '—';
+const isNum = v => typeof v === 'number' && isFinite(v);
+function num(v, d = 1) { return isNum(v) ? v.toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d}) : NA; }
+function compact(v) {
+  if (!isNum(v)) return NA;
+  const a = Math.abs(v);
+  if (a >= 1e9) return (v / 1e9).toFixed(a >= 1e10 ? 0 : 1) + 'B';
+  if (a >= 1e6) return (v / 1e6).toFixed(a >= 1e7 ? 0 : 1) + 'M';
+  if (a >= 1e4) return (v / 1e3).toFixed(0) + 'K';
+  if (a >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+  return Math.round(v).toString();
 }
-
-function initTheme() {
-  if (localStorage.getItem('theme') === 'light') {
-    document.body.classList.add('light');
-    document.getElementById('theme-btn').textContent = 'Dark';
-  }
+function secs(v) {
+  if (!isNum(v)) return NA;
+  if (v < 1) return Math.round(v * 1000) + ' ms';
+  if (v < 60) return v.toFixed(v < 10 ? 2 : 1) + ' s';
+  return (v / 60).toFixed(1) + ' min';
 }
-initTheme();
-
-// Commercial frontier model: physics-based power estimate for apples-to-apples comparison.
-// For each nimbus model we ask: "What would a commercial frontier cluster draw to serve the same tokens?"
-// This includes the hosting floor (idle power to keep model in memory) + marginal per-token energy.
-//
-// Spec: ~1.5T MoE, ~300B active params, FP8 inference.
-// Hardware: 24× H100-80GB minimum (1.5 TB weights + KV cache + activations → need ≥1.92 TB HBM).
-//
-// Prefill (compute-bound): 2×300B = 600 GFLOPS/token. 24× H100 at 60% util = 14,200 TFLOPS.
-//   Throughput: ~23,700 tok/s. Marginal power above idle: (700−225)×24 = 11,400 W.
-//   → ~0.5 J/input-token marginal.
-//
-// Decode (memory-bandwidth-bound): must load 300 GB active weights per step.
-//   24× H100 at 3.35 TB/s = 80.4 TB/s → 270 tok/s per sequence.
-//   At low batch (B≈1–4, matching typical nimbus traffic): ~100–150 W above idle per GPU.
-//   → ~6 J/output-token marginal.
-//
-// Sources: H100 specs (NVIDIA), transformer FLOPs scaling, Delavande et al. (2025).
-const FRONTIER = {
-  label: 'Commercial frontier',
-  desc: '~1.5T MoE, ~300B active · 24× H100-80GB',
-  numGPUs: 24,
-  idleWattsPerGPU: 225,
-  prefillJPerToken: 0.5,
-  decodeJPerToken: 6.0,
-};
-const FRONTIER_IDLE_W = FRONTIER.numGPUs * FRONTIER.idleWattsPerGPU; // 5400 W
-
-// Everyday reference frames for CO2 totals, in the style of CodeCarbon.
-// Sources cited in /methodology.
-const REF_CAR_G_PER_MILE = 404;       // EPA: average gasoline passenger vehicle, g CO2/mile
-const REF_PHONE_CHARGE_G = 8.22;      // g CO2 per full smartphone charge (commonly cited estimate)
-const REF_FRIDGE_WATTS = 150;         // average household refrigerator draw, W
-const REF_TREE_KG_PER_MONTH = 1.75;   // kg CO2 absorbed per mature tree per month (rough estimate)
-
-function frontierWatts(promptTokPerSec, genTokPerSec) {
-  return FRONTIER_IDLE_W
-       + promptTokPerSec * FRONTIER.prefillJPerToken
-       + genTokPerSec    * FRONTIER.decodeJPerToken;
+function pct(v) { return isNum(v) ? v.toFixed(v >= 99.95 || v === 0 ? 0 : 1) + '%' : NA; }
+function grams(g) {
+  if (!isNum(g)) return NA;
+  return g >= 1000 ? (g / 1000).toFixed(2) + ' kg' : g.toFixed(g < 10 ? 2 : 1) + ' g';
 }
-
-function intensityColor(kg){ return kg<=.25?'#22c55e':kg<=.40?'#eab308':kg<=.55?'#f97316':'#ef4444'; }
-
-// nimbus has exactly one fixed location — Berkeley, CA (CAMX eGRID
-// subregion) — so this is a constant, not a lookup. hostname is accepted
-// (and ignored) to keep the call site at the model card unchanged.
-function locationLabel(hostname) {
-  return 'Berkeley, CA · <a href="/methodology" style="color:inherit;text-decoration:none">CAMX</a>';
+function ago(iso) {
+  if (!iso) return NA;
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 90) return 'just now';
+  if (s < 3600) return Math.round(s / 60) + ' min ago';
+  if (s < 86400 * 2) return Math.round(s / 3600) + ' h ago';
+  return Math.round(s / 86400) + ' d ago';
 }
-function co2Color(gph){ return gph<100?'green':gph<300?'yellow':gph<600?'orange':'red'; }
-function fmt(n,d=1){ return (n==null||isNaN(n))?'—':n.toFixed(d); }
-function shortModel(name){ if(!name)return null; const p=name.split('/'); return p[p.length-1]; }
+function when(iso) {
+  return iso ? new Date(iso).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'}) : NA;
+}
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+const winLabel = w => ({'24h': '24 h', '7d': '7 d', '15d': '15 d'}[w] || w);
 
+// Commercial frontier estimate (see /methodology): hosting floor + marginal
+// per-token energy for a ~1.5T-param MoE on 24x H100.
+const FRONTIER = {idleW: 24 * 225, prefillJ: 0.5, decodeJ: 6.0};
+const frontierWatts = (p, g) => FRONTIER.idleW + p * FRONTIER.prefillJ + g * FRONTIER.decodeJ;
+
+// Everyday reference frames (sources in /methodology).
+const REF = {carGPerMile: 404, phoneChargeG: 8.22, fridgeW: 150, treeKgPerMonth: 1.75};
+
+// ---- data --------------------------------------------------------------------
 async function load() {
   const st = document.getElementById('status');
   try {
     const res = await fetch(API);
-    if (!res.ok) throw new Error(res.statusText);
-    const data = await res.json();
-    render(data);
-    st.textContent = 'Updated ' + new Date(data.updated_at).toLocaleTimeString();
-    st.className = 'ok';
-  } catch(e) {
-    st.textContent = 'Error: ' + e.message;
-    st.className = 'err';
+    if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+    data = await res.json();
+    render();
+    st.textContent = 'Updated ' + new Date(data.updated_at).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+  } catch (e) {
+    st.textContent = 'Could not load: ' + e.message;
   }
 }
 
-async function loadTimeSeries(range) {
-  try {
-    const res = await fetch(`${TS_API}?range=${range}`);
-    const data = await res.json();
-    renderTimeSeries(data);
-  } catch(e) { console.warn('timeseries:', e); }
+// Which record a card shows: live state in Live mode when the model is up;
+// otherwise the aggregate for the selected window, falling back to the
+// longest window that has data (a model offline for a week still shows
+// its record).
+function pickAggregate(m) {
+  if (m.aggregates[win]) return {agg: m.aggregates[win], window: win, fallback: false};
+  const order = (data.windows || []).map(w => w.name);
+  for (let i = order.length - 1; i >= 0; i--) {
+    if (m.aggregates[order[i]]) return {agg: m.aggregates[order[i]], window: order[i], fallback: true};
+  }
+  return {agg: null, window: win, fallback: true};
 }
 
-function render(data) {
-  lastData = data;
-  const models = (data.models||[]).slice().sort((a,b)=>b.co2_grams_per_hour-a.co2_grams_per_hour);
+function render() {
+  if (!data) return;
+  renderControls();
+  renderSummary();
+  renderCards();
+}
 
-  // Brand the page from the nodes the API reports on: a single node keeps its
-  // own name (this image still serves one-node deployments), several become
-  // the cluster view.
-  const nodes = [...new Set(models.map(m => m.node).filter(Boolean))];
-  const title = nodes.length === 1 ? nodes[0] : 'Cluster';
-  document.title = `${title} Carbon Dashboard`;
-  const h1 = document.getElementById('page-title');
-  if (h1) h1.innerHTML = `${title} <span>Carbon</span> Dashboard`;
+function renderControls() {
+  const names = (data.windows || []).map(w => w.name);
+  if (names.length && !names.includes(win)) { win = names.includes('7d') ? '7d' : names[0]; saveView(); }
+  if (mode !== 'live' && mode !== 'aggregate') mode = 'live';
+  document.querySelectorAll('#mode-seg button').forEach(b => b.setAttribute('aria-pressed', b.dataset.mode === mode));
+  const seg = document.getElementById('win-seg');
+  if (!seg.children.length) {
+    seg.innerHTML = (data.windows || []).map(w => `<button type="button" data-win="${esc(w.name)}">${winLabel(w.name)}</button>`).join('');
+    seg.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+      win = b.dataset.win; saveView(); render(); loadTimeSeries();
+    }));
+  }
+  seg.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', b.dataset.win === win));
+  const retention = data.retention_start ? ` Prometheus holds data since ${when(data.retention_start)}.` : '';
+  document.getElementById('controls-note').textContent = mode === 'live'
+    ? `Running models show live numbers; models that are not running show their ${winLabel(win)} record.${retention}`
+    : `Every model shows its record over the last ${winLabel(win)}. Energy counts idle serving time too.${retention}`;
+}
 
-  const totalPower   = models.reduce((s,m)=>s+m.power_watts,0);
-  const totalCO2hr   = models.reduce((s,m)=>s+m.co2_grams_per_hour,0);
-  const totalGPUs    = models.reduce((s,m)=>s+m.gpu_count,0);
-  const activeN      = models.filter(m=>m.tokens_per_sec>0.1).length;
-  const avgIntensity = models.length ? models.reduce((s,m)=>s+m.carbon_intensity_kg_per_kwh,0)/models.length : 0;
+function tile(label, value, unit) {
+  return `<div class="tile"><div class="tile-label">${label}</div><div class="tile-value">${value}</div><div class="tile-unit">${unit}</div></div>`;
+}
 
-  document.getElementById('summary').innerHTML = `
-    <div class="stat"><div class="stat-label">Total Power</div><div class="stat-value">${fmt(totalPower/1000,2)}</div><div class="stat-unit">kilowatts</div></div>
-    <div class="stat"><div class="stat-label">CO₂ / hour</div><div class="stat-value">${fmt(totalCO2hr/1000,2)}</div><div class="stat-unit">kg CO₂e</div></div>
-    <div class="stat"><div class="stat-label">CO₂ / day</div><div class="stat-value">${fmt(totalCO2hr*24/1000,1)}</div><div class="stat-unit">kg CO₂e</div></div>
-    <div class="stat"><div class="stat-label">Active GPUs</div><div class="stat-value">${totalGPUs}</div><div class="stat-unit">across ${nodes.length} node${nodes.length===1?'':'s'}</div></div>
-    <div class="stat"><div class="stat-label">Active Models</div><div class="stat-value">${activeN}</div><div class="stat-unit">generating tokens</div></div>
-    <div class="stat"><div class="stat-label">Avg Grid Intensity</div><div class="stat-value">${fmt(avgIntensity,3)}</div><div class="stat-unit">kg CO₂/kWh</div></div>
-  `;
+function renderSummary() {
+  const ms = data.models || [];
+  const up = ms.filter(m => m.live);
+  const gen = ms.filter(m => m.status === 'generating');
+  let html;
+  if (mode === 'live') {
+    const w = up.reduce((s, m) => s + m.live.power_watts, 0);
+    const co2h = up.reduce((s, m) => s + m.live.co2_grams_per_hour, 0);
+    const tok = up.reduce((s, m) => s + m.live.prompt_tokens_per_sec + m.live.generation_tokens_per_sec, 0);
+    const running = up.reduce((s, m) => s + m.live.requests_running, 0);
+    html = tile('LLM GPU power now', num(w, 1), 'watts, serving models only')
+      + tile('CO₂ per hour', num(co2h, 2), 'grams at current draw')
+      + tile('Models serving', `${up.length}`, `${gen.length} generating · ${ms.length - up.length} offline`)
+      + tile('Requests in flight', compact(running), 'across all models')
+      + tile('Tokens per second', num(tok, 1), 'prompt + generated, all models');
+  } else {
+    const aggs = ms.map(m => m.aggregates[win]).filter(Boolean);
+    const kwh = aggs.reduce((s, a) => s + a.energy_kwh, 0);
+    const g = aggs.reduce((s, a) => s + a.co2_grams, 0);
+    const tokens = aggs.reduce((s, a) => s + a.prompt_tokens + a.generation_tokens, 0);
+    const reqs = aggs.reduce((s, a) => s + a.requests, 0);
+    const mgPerTok = tokens > 0 ? g * 1000 / tokens : null;
+    html = tile('Energy', num(kwh, 2), `kWh over ${winLabel(win)}`)
+      + tile('CO₂ emitted', grams(g), `over ${winLabel(win)}`)
+      + tile('Tokens processed', compact(tokens), `${compact(reqs)} requests`)
+      + tile('CO₂ per 1K tokens', isNum(mgPerTok) ? num(mgPerTok, 2) : NA, 'mg, all serving energy')
+      + tile('Models with data', `${aggs.length}`, `in the last ${winLabel(win)}`);
+  }
+  document.getElementById('summary').innerHTML = html;
+}
 
-  // Model cards
-  document.getElementById('cards').innerHTML = models.map(m=>{
-    const active = m.tokens_per_sec > 0.1;
-    const cc  = co2Color(m.co2_grams_per_hour);
-    const dot = intensityColor(m.carbon_intensity_kg_per_kwh);
-    const promptPct = active && m.tokens_per_sec > 0 ? (m.prompt_tokens_per_sec / m.tokens_per_sec * 100) : null;
+const perfRow = (label, value, title = '') =>
+  `<div${title ? ` title="${esc(title)}"` : ''}><dt>${label}</dt><dd class="${value === NA ? 'na' : ''}">${value}</dd></div>`;
 
-    // "24h Average" card: every number here is an active-only long-term mean
-    // (falls back to 7d when a model hasn't been active in the last 24h) —
-    // deliberately never mixed with live/instantaneous readings, which is
-    // what made the old single-card layout hard to parse (a live watts
-    // number sitting next to a 24h-avg J/token sitting next to a "24h avg"
-    // footnote on a different field entirely). Live card and Average card
-    // now mirror each other's metric layout so it's obvious which is which.
-    const avgWindow = m.power_watts_active_avg_24h != null ? '24h' : (m.power_watts_active_avg_7d != null ? '7d' : null);
-    const avgPower  = m.power_watts_active_avg_24h ?? m.power_watts_active_avg_7d ?? null;
-    const avgPrompt = m.prompt_tokens_per_sec_active_avg_24h ?? m.prompt_tokens_per_sec_active_avg_7d ?? null;
-    const avgGen    = m.generation_tokens_per_sec_active_avg_24h ?? m.generation_tokens_per_sec_active_avg_7d ?? null;
-    const avgDecode = m.decode_tokens_per_sec_avg_24h ?? m.decode_tokens_per_sec_avg_7d ?? null;
-    const avgCO2Tok = m.co2_mg_per_token_avg_24h ?? m.co2_mg_per_token_avg_7d ?? null;
-    const avgCO2Hr  = avgPower!=null ? avgPower * m.carbon_intensity_kg_per_kwh : null; // g/hr = W × kg/kWh, same formula as the live tile
-    const hasAvg = avgWindow != null;
+function hardware(m) {
+  const hosts = m.power_hosts || [m.node];
+  const tp = hosts.length > 1 ? ` · tensor-parallel ×${hosts.length}` : '';
+  return `${esc(hosts.join(' + '))} · ${m.gpu_count}× ${esc(m.gpu_hardware || 'GPU')}${tp}`;
+}
 
-    // J/token and the frontier comparison were always averaged-window
-    // metrics (never live), so they belong entirely in the Average card now.
-    // Uses avgGen (active-period average generation throughput), not
-    // avgDecode (the instantaneous per-step rate while emitting a token) —
-    // different metrics, and avgGen is the one dimensionally comparable to
-    // avgPrompt for a combined tok/s denominator.
-    const avgTok = (avgPrompt||0) + (avgGen||0);
-    const jPerToken = hasAvg && avgTok > 0.1 && avgPower > 0 ? avgPower / avgTok : null;
-
-    // Frontier-model comparison: physics-based estimate of what a commercial
-    // frontier cluster would draw to serve the same tokens. Shown only when
-    // there's an active-period average to compare against. Plain
-    // informational text/visualization only, no color verdict: nimbus's
-    // absolute power draw is real regardless of how it compares to a
-    // hypothetical 24-GPU commercial cluster.
-    const fw = hasAvg ? frontierWatts(avgPrompt||0, avgGen||0) : 0;
-    let wattsCmp = '';
-    let frontierMetric = '';
-    if (hasAvg && avgPower > 0 && fw > 0) {
-      const ratio = fw / avgPower;
-      const nrpPct = Math.min(avgPower / fw * 100, 100).toFixed(1);
-      const ratioText = ratio >= 1.05
-        ? `${ratio.toFixed(1)}× less energy than ${FRONTIER.label} for same tokens`
-        : ratio < 0.95
-          ? `${(1/ratio).toFixed(1)}× more energy than ${FRONTIER.label}`
-          : `≈ same energy as ${FRONTIER.label}`;
-      const fIdleW = FRONTIER_IDLE_W;
-      const fMargW = fw - fIdleW;
-      wattsCmp = `
-        <div class="token-cmp">
-          <div class="token-cmp-label">Power (${avgWindow} avg, active): ${m.node} vs. ${FRONTIER.label} for same tokens</div>
-          <div class="token-cmp-track">
-            <div class="token-cmp-bar" style="width:${nrpPct}%;background:#6366f1;top:2px;height:14px;border-radius:2px"></div>
-            <div style="position:absolute;top:2px;left:0;width:100%;height:14px;border-radius:2px;background:rgba(99,102,241,0.18)"></div>
-          </div>
-          <div class="token-cmp-legend">
-            <span style="color:var(--text)">${m.node}: ${avgPower.toLocaleString(undefined,{maximumFractionDigits:0})} W</span>
-            <span style="color:#6366f1">${FRONTIER.label}: ${fw.toLocaleString(undefined,{maximumFractionDigits:0})} W <span style="opacity:.6">(${fIdleW.toLocaleString()} idle + ${fMargW.toLocaleString(undefined,{maximumFractionDigits:0})} marginal)</span></span>
-          </div>
-          <div class="token-cmp-ratio">${ratioText}</div>
-        </div>`;
-      const frontierUnitText = ratio >= 1.05 ? 'less energy' : ratio < 0.95 ? 'more energy' : 'same energy';
-      frontierMetric = `<div class="metric"><div class="metric-label">vs. ${FRONTIER.label}</div><div class="metric-value">${fmt(fw/avgPower,1)}×</div><div class="metric-unit">${frontierUnitText} · ${avgWindow} avg</div></div>`;
-    }
-
-    return `
-    <div class="model-row">
-    <div class="card">
-      <div class="card-header">
-        <div class="model-name ${m.model_name?'':'unknown'}"><span class="node-tag">${m.node}</span>${m.model_name||m.container}</div>
-        <span class="badge ${active?'badge-active':'badge-idle'}">${active?'active':'idle'}</span>
-      </div>
-      <div class="card-meta">
-        <span>Live</span>
-        <span>${m.gpu_count}× ${m.gpu_hardware||'—'}</span>
-        ${m.power_is_node_total ? '<span title="This node&apos;s GPUs are shared with other workloads, so the figure is total node GPU power — an upper bound for this model.">node-total power</span>' : ''}
-        ${promptPct != null ? `<span>${fmt(promptPct,0)}% input tokens</span>` : ''}
-      </div>
-      <div class="metrics">
-        <div class="metric"><div class="metric-label">CO₂ / hr</div><div class="metric-value ${cc}">${fmt(m.co2_grams_per_hour)}</div><div class="metric-unit">grams</div></div>
-        <div class="metric"><div class="metric-label">GPU Power</div><div class="metric-value">${fmt(m.power_watts)}</div><div class="metric-unit">watts</div></div>
-        <div class="metric"><div class="metric-label">CO₂ / token</div><div class="metric-value">${m.co2_mg_per_token?fmt(m.co2_mg_per_token,3):'—'}</div><div class="metric-unit">mg · 5 min</div></div>
-        <div class="metric"><div class="metric-label">Input tok/s</div><div class="metric-value">${active?fmt(m.prompt_tokens_per_sec):'—'}</div><div class="metric-unit">tok/s prompt</div></div>
-        <div class="metric"><div class="metric-label">Decode speed</div><div class="metric-value">${m.decode_tokens_per_sec?fmt(m.decode_tokens_per_sec):(active?fmt(m.generation_tokens_per_sec):'—')}</div><div class="metric-unit">tok/s generating${active&&m.decode_tokens_per_sec?` · <span style="color:var(--muted)">${fmt(m.generation_tokens_per_sec)} throughput</span>`:''}</div></div>
-      </div>
-      <div class="grid-intensity">
-        <div class="grid-intensity-header">
-          <span class="grid-location">${locationLabel(m.node)}</span>
-          <span class="grid-value" style="color:${dot}">${m.carbon_intensity_kg_per_kwh} kg CO₂/kWh</span>
-        </div>
-        <div class="grid-track">
-          <div class="grid-track-fill"></div>
-          <div class="grid-avg-tick" style="left:${(0.386/0.75*100).toFixed(1)}%"></div>
-          <div class="grid-marker" style="left:${Math.min(m.carbon_intensity_kg_per_kwh/0.75*100,100).toFixed(1)}%;background:${dot}"></div>
-        </div>
-        <div class="grid-legend">
-          <span>clean</span>
-          <span>US avg</span>
-          <span>coal</span>
-        </div>
-      </div>
-    </div>
-    <div class="card avg-card">
-      <div class="card-header">
-        <div class="model-name ${m.model_name?'':'unknown'}"><span class="node-tag">${m.node}</span>${m.model_name||m.container}</div>
-        <span class="badge" style="background:rgba(99,102,241,.15);color:var(--accent)">${hasAvg?`${avgWindow} avg`:'no data yet'}</span>
-      </div>
-      <div class="card-meta">
-        <span>While active, ${avgWindow||'24h'} window</span>
-      </div>
-      <div class="metrics">
-        <div class="metric"><div class="metric-label">CO₂ / hr</div><div class="metric-value ${avgCO2Hr!=null?co2Color(avgCO2Hr):''}">${avgCO2Hr!=null?fmt(avgCO2Hr):'—'}</div><div class="metric-unit">grams</div></div>
-        <div class="metric"><div class="metric-label">GPU Power</div><div class="metric-value">${avgPower!=null?fmt(avgPower):'—'}</div><div class="metric-unit">watts</div></div>
-        <div class="metric"><div class="metric-label">CO₂ / token</div><div class="metric-value">${avgCO2Tok!=null?fmt(avgCO2Tok,3):'—'}</div><div class="metric-unit">mg</div></div>
-        <div class="metric"><div class="metric-label">Input tok/s</div><div class="metric-value">${avgPrompt!=null?fmt(avgPrompt):'—'}</div><div class="metric-unit">tok/s prompt</div></div>
-        <div class="metric"><div class="metric-label">Decode speed</div><div class="metric-value">${avgDecode!=null?fmt(avgDecode):'—'}</div><div class="metric-unit">tok/s generating</div></div>
-        <div class="metric"><div class="metric-label">J / token</div><div class="metric-value">${jPerToken!=null?fmt(jPerToken,3):'—'}</div><div class="metric-unit">joules</div></div>
-        ${frontierMetric}
-      </div>
-      ${wattsCmp}
-    </div>
-    <div class="card activity-card">
-      <div class="card-header">
-        <div class="model-name"><span class="node-tag">${m.node}</span>${shortModel(m.model_name) || m.container} — Live Activity</div>
-      </div>
-      <div class="activity-grid">
-        <div class="metric"><div class="metric-label">Running</div><div class="metric-value">${fmt(m.num_requests_running,0)}</div><div class="metric-unit">requests</div></div>
-        <div class="metric"><div class="metric-label">Queued</div><div class="metric-value">${fmt(m.num_requests_waiting,0)}</div><div class="metric-unit">requests</div></div>
-        <div class="metric"><div class="metric-label">KV Cache</div><div class="metric-value">${fmt(m.kv_cache_usage_percent)}</div><div class="metric-unit">percent</div></div>
-        <div class="metric"><div class="metric-label">GPU Util</div><div class="metric-value">${fmt(m.gpu_util_percent)}</div><div class="metric-unit">percent</div></div>
-        <div class="metric"><div class="metric-label">Requests</div><div class="metric-value">${fmt(m.requests_per_hour)}</div><div class="metric-unit">per hour</div></div>
-        ${m.mtp_acceptance_percent!=null ? `<div class="metric"><div class="metric-label">MTP Accept</div><div class="metric-value">${fmt(m.mtp_acceptance_percent)}</div><div class="metric-unit">percent</div></div>` : ''}
-      </div>
-    </div>
+function liveBody(m) {
+  const l = m.live;
+  const carbon = `
+    <div class="carbon">
+      <div class="m"><div class="m-label">GPU power</div><div class="m-value">${num(l.power_watts, 1)}</div><div class="m-unit">watts, 5 min</div></div>
+      <div class="m"><div class="m-label">CO₂ / hour</div><div class="m-value">${num(l.co2_grams_per_hour, 2)}</div><div class="m-unit">grams</div></div>
+      <div class="m"><div class="m-label">CO₂ / token</div><div class="m-value">${isNum(l.co2_mg_per_token) ? num(l.co2_mg_per_token, 4) : NA}</div><div class="m-unit">${isNum(l.co2_mg_per_token) ? 'mg' : 'mg · idle'}</div></div>
     </div>`;
+  const perf = `
+    <dl class="perf">
+      ${perfRow('Decode speed', isNum(l.decode_tokens_per_sec) ? num(l.decode_tokens_per_sec, 1) + ' tok/s' : NA, 'Output tokens per second while generating (2 min)')}
+      ${perfRow('Prompt tokens', num(l.prompt_tokens_per_sec, 1) + ' /s', 'Input tokens processed per second (2 min)')}
+      ${perfRow('Running / queued', `${compact(l.requests_running)} / ${compact(l.requests_waiting)}`)}
+      ${perfRow('Requests', num(l.requests_per_hour, 1) + ' /h', 'Completed requests per hour (15 min)')}
+      ${perfRow('TTFT p50', secs(l.ttft_p50_seconds), 'Time to first token, median (15 min)')}
+      ${perfRow('Queue p50', secs(l.queue_p50_seconds), 'Time waiting before scheduling, median (15 min)')}
+      ${perfRow('E2E p50', secs(l.e2e_p50_seconds), 'End-to-end request latency, median (15 min)')}
+      ${perfRow('E2E p95', secs(l.e2e_p95_seconds), 'End-to-end request latency, 95th percentile (15 min)')}
+      ${perfRow('KV cache', pct(l.kv_cache_usage_percent))}
+      ${perfRow('GPU util', pct(l.gpu_util_percent), 'Mean over every GPU the model spans (5 min)')}
+      ${perfRow('Prefix-cache hits', pct(l.prefix_cache_hit_percent), 'Share of prompt tokens served from cache (15 min)')}
+      ${perfRow('Spec-decode accept', pct(l.spec_decode_accept_percent), 'Draft tokens accepted by speculative decoding (15 min)')}
+    </dl>`;
+  return carbon + perf;
+}
+
+function aggBody(a) {
+  if (!a) return '<p class="empty">No data for this model in Prometheus’s retention.</p>';
+  const fw = isNum(a.prompt_tokens_per_sec_active) && a.active_power_watts > 0
+    ? frontierWatts(a.prompt_tokens_per_sec_active, a.generation_tokens_per_sec_active || 0) / a.active_power_watts : null;
+  const carbon = `
+    <div class="carbon">
+      <div class="m"><div class="m-label">GPU power</div><div class="m-value">${num(a.power_watts, 1)}</div><div class="m-unit">W mean${a.active_hours > 0 ? ` · ${num(a.active_power_watts, 0)} W working` : ''}</div></div>
+      <div class="m"><div class="m-label">CO₂ / hour</div><div class="m-value">${num(a.co2_grams_per_hour, 2)}</div><div class="m-unit">grams, while serving</div></div>
+      <div class="m" title="All serving energy (idle hosting included) divided by every token. The figure after it counts only energy spent while generating."><div class="m-label">CO₂ / token</div><div class="m-value">${isNum(a.co2_mg_per_token) ? num(a.co2_mg_per_token, 4) : NA}</div><div class="m-unit">${isNum(a.co2_mg_per_token_active) ? `mg · ${num(a.co2_mg_per_token_active, 4)} working` : 'mg'}</div></div>
+    </div>
+    <p class="carbon-extra">${num(a.energy_kwh, 3)} kWh · ${grams(a.co2_grams)} CO₂ · ${isNum(a.joules_per_token) ? num(a.joules_per_token, 3) + ' J/token' : 'no tokens'}${isNum(fw) ? ` · ~${compact(fw)}× less energy than a frontier-scale deployment (estimate)` : ''}</p>`;
+  const perf = `
+    <dl class="perf">
+      ${perfRow('Decode speed', isNum(a.decode_tokens_per_sec) ? num(a.decode_tokens_per_sec, 1) + ' tok/s' : NA, 'Output tokens per second while generating')}
+      ${perfRow('Uptime', pct(a.uptime_percent), `${num(a.serving_hours, 1)} h serving of ${num(a.covered_hours, 0)} h in the window`)}
+      ${perfRow('Tokens in / out', `${compact(a.prompt_tokens)} / ${compact(a.generation_tokens)}`)}
+      ${perfRow('Requests', compact(a.requests), isNum(a.mean_prompt_tokens) ? `Mean ${compact(a.mean_prompt_tokens)} prompt and ${compact(a.mean_generation_tokens)} generated tokens per request` : '')}
+      ${perfRow('Tokens / request', isNum(a.mean_prompt_tokens) ? `${compact(a.mean_prompt_tokens)} → ${compact(a.mean_generation_tokens)}` : NA, 'Mean prompt tokens → mean generated tokens')}
+      ${perfRow('Peak concurrent', compact(a.peak_requests_running), 'Most requests running at once (1 min resolution)')}
+      ${perfRow('TTFT p50 / p95', isNum(a.ttft_p50_seconds) ? `${secs(a.ttft_p50_seconds)} / ${secs(a.ttft_p95_seconds)}` : NA, 'Time to first token')}
+      ${perfRow('E2E p50 / p95', isNum(a.e2e_p50_seconds) ? `${secs(a.e2e_p50_seconds)} / ${secs(a.e2e_p95_seconds)}` : NA, 'End-to-end request latency')}
+      ${perfRow('Queue p50', secs(a.queue_p50_seconds), 'Time waiting before scheduling, median')}
+      ${perfRow('Working time', num(a.active_hours, 1) + ' h', 'Hours above 5 tok/s')}
+      ${perfRow('Prefix-cache hits', pct(a.prefix_cache_hit_percent), 'Share of prompt tokens served from cache')}
+      ${perfRow('Spec-decode accept', pct(a.spec_decode_accept_percent), 'Draft tokens accepted by speculative decoding')}
+    </dl>`;
+  return carbon + perf;
+}
+
+// The oldest instant any query can see: the later of Prometheus retention
+// and the start of the widest window. A first_seen at that edge means the
+// model is at least that old, not that it appeared then.
+function dataStart() {
+  const widest = Math.max(0, ...(data.windows || []).map(w => w.seconds));
+  const byWindow = new Date(new Date(data.updated_at).getTime() - widest * 1000);
+  const ret = data.retention_start ? new Date(data.retention_start) : byWindow;
+  return ret > byWindow ? ret : byWindow;
+}
+
+const STATE_LABEL = ['not serving', 'serving, idle', 'generating'];
+function strip(m) {
+  const a = m.availability && m.availability[win];
+  const n = a ? a.states.length : 0;
+  const cells = a ? a.states.map((s, i) => {
+    const t0 = (a.start + i * a.step_seconds) * 1000, t1 = t0 + a.step_seconds * 1000;
+    return `<span data-s="${s}" data-t0="${t0}" data-t1="${t1}"></span>`;
+  }).join('') : Array.from({length: 1}, () => '<span data-s="0"></span>').join('');
+  return `
+    <div class="strip-wrap">
+      <div class="strip-head"><span>Availability, last ${winLabel(win)}</span><span>${a ? `${n} × ${Math.round(a.step_seconds / 60) >= 60 ? (a.step_seconds / 3600) + ' h' : (a.step_seconds / 60) + ' min'}` : 'no data'}</span></div>
+      <div class="strip" role="img" aria-label="${esc(stripSummary(a))}">${cells}</div>
+      <div class="legend"><span><i style="background:var(--strip-2)"></i>generating</span><span><i style="background:var(--strip-1)"></i>serving, idle</span><span><i style="background:var(--strip-0)"></i>not serving</span></div>
+    </div>`;
+}
+function stripSummary(a) {
+  if (!a) return 'No availability data';
+  const c = [0, 0, 0];
+  a.states.forEach(s => c[s]++);
+  return `Of ${a.states.length} intervals: ${c[2]} generating, ${c[1]} serving idle, ${c[0]} not serving`;
+}
+
+function renderCards() {
+  const ms = data.models || [];
+  const el = document.getElementById('cards');
+  if (!ms.length) { el.innerHTML = '<p class="empty">No models found in Prometheus.</p>'; return; }
+  el.innerHTML = ms.map(m => {
+    const showLive = mode === 'live' && m.live;
+    const pick = pickAggregate(m);
+    let source;
+    if (showLive) source = `<p class="source">Live · updated ${esc(new Date(data.updated_at).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}))}</p>`;
+    else if (mode === 'live') source = `<p class="source fallback">Not running · showing its ${winLabel(pick.window)} record · last seen ${ago(m.last_seen)}</p>`;
+    else source = `<p class="source${pick.fallback ? ' fallback' : ''}">${pick.fallback ? `No data in the last ${winLabel(win)} · showing ${winLabel(pick.window)}` : `${winLabel(win)} aggregate`}</p>`;
+    const firstSeen = m.first_seen && (new Date(m.first_seen) - dataStart()) < 2 * 3600e3
+      ? `before ${when(dataStart().toISOString())}` : when(m.first_seen);
+    return `
+    <article class="card ${m.status}">
+      <div class="card-top">
+        <div style="min-width:0">
+          <h3 class="card-title">${esc(m.display_name || m.model_name)}</h3>
+          <p class="card-sub">served as <code>${esc(m.model_name)}</code> · ${hardware(m)}</p>
+          ${m.description ? `<p class="card-desc">${esc(m.description)}</p>` : ''}
+        </div>
+        <span class="pill ${m.status}"><span class="dot" aria-hidden="true"></span>${{generating: 'Generating', idle: 'Idle', offline: 'Offline'}[m.status] || esc(m.status)}</span>
+      </div>
+      ${source}
+      ${showLive ? liveBody(m) : aggBody(pick.agg)}
+      ${strip(m)}
+      <div class="card-foot"><span>First seen ${firstSeen}</span><span>Last seen ${m.status === 'offline' ? when(m.last_seen) : 'now'}</span></div>
+    </article>`;
   }).join('');
 }
 
-// The backend always emits step as one of "5m0s", "1h0m0s", "6h0m0s"
-// (Go's time.Duration.String()) -- parse the h/m/s components present.
-function parseStepSeconds(stepStr) {
-  const h = /(\d+)h/.exec(stepStr);
-  const m = /(\d+)m/.exec(stepStr);
-  const s = /(\d+)s/.exec(stepStr);
-  return (h?+h[1]*3600:0) + (m?+m[1]*60:0) + (s?+s[1]:0);
+// ---- availability tooltip ---------------------------------------------------
+const tip = document.getElementById('tip');
+document.getElementById('cards').addEventListener('mousemove', e => {
+  const cell = e.target.closest('.strip span[data-t0]');
+  if (!cell) { tip.style.display = 'none'; return; }
+  const f = t => new Date(+t).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+  tip.innerHTML = `<strong>${STATE_LABEL[+cell.dataset.s]}</strong><br>${f(cell.dataset.t0)} – ${f(cell.dataset.t1)}`;
+  tip.style.display = 'block';
+  const x = Math.min(e.clientX + 12, innerWidth - tip.offsetWidth - 8);
+  tip.style.left = x + 'px';
+  tip.style.top = (e.clientY + 14) + 'px';
+});
+document.getElementById('cards').addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+
+// ---- cumulative CO2 chart ----------------------------------------------------
+function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+function styleChart() {
+  const o = lineChart.options;
+  o.scales.x.ticks.color = o.scales.y.ticks.color = o.scales.y.title.color = css('--muted');
+  o.scales.x.grid.color = o.scales.y.grid.color = css('--grid');
+  lineChart.data.datasets[0].borderColor = css('--accent');
+  lineChart.data.datasets[0].backgroundColor = css('--accent-wash');
+  lineChart.update('none');
 }
 
-// Cumulative CO₂ emissions over the selected window — integrates the
-// co2_grams_per_hour rate series using the rectangle rule (rate × step
-// duration), running-summed. Always populated as long as the range has any
-// points, even during idle periods (the total simply grows slowly).
-function renderTimeSeries(data) {
-  const pts = data.points || [];
-  if (!pts.length) return;
-
-  const rangeLabel = {'24h':'past 24 hours','7d':'past 7 days','30d':'past 30 days'}[currentRange]||currentRange;
-
-  const mkLabel = p => {
-    const d = new Date(p.t * 1000);
-    if (currentRange === '24h') return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
-    if (currentRange === '7d')  return d.toLocaleDateString([],{month:'short',day:'numeric'}) + ' ' + d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
-    return d.toLocaleDateString([],{month:'short',day:'numeric'});
-  };
-
-  const stepHours = parseStepSeconds(data.step) / 3600;
+async function loadTimeSeries() {
+  let ts;
+  try {
+    const res = await fetch(`${TS_API}?range=${win}`);
+    ts = await res.json();
+  } catch (e) { console.warn('timeseries:', e); return; }
+  const pts = ts.points || [];
+  const stepH = parseStep(ts.step) / 3600;
   let running = 0;
-  const cumulativeGrams = pts.map(p => {
-    running += p.co2_grams_per_hour * stepHours;
-    return +running.toFixed(2);
-  });
-  lastEmissionsTotalGrams = running;
+  const cum = pts.map(p => (running += p.co2_grams_per_hour * stepH, +running.toFixed(2)));
+  document.getElementById('chart-title').textContent = `Cumulative LLM CO₂, last ${winLabel(win)}`;
+  document.getElementById('chart-total').textContent = pts.length ? `Total ${grams(running)} CO₂e` : 'No data';
   renderReferenceFrames(running);
 
-  const totalLabel = running >= 1000
-    ? (running/1000).toFixed(2) + ' kg CO₂e'
-    : running.toFixed(1) + ' g CO₂e';
-
-  const chartData = {
-    labels: pts.map(mkLabel),
-    datasets: [{
-      label: 'Cumulative CO₂ (g)',
-      data: cumulativeGrams,
-      borderColor: '#6366f1',
-      backgroundColor: 'rgba(99,102,241,0.1)',
-      fill: true, tension: 0.3, pointRadius: 0,
-    }],
-  };
-  const lc = chartColors();
-  const options = {
-    responsive: true,
-    interaction: { mode:'index', intersect:false },
-    plugins: {
-      legend: { labels:{ color:lc.legend, font:{size:10}, boxWidth:12 } },
-      title: { display:true, text:`${rangeLabel} — Total: ${totalLabel}`,
-               color:lc.tick, font:{size:11, weight:'normal'}, padding:{bottom:8} },
-      tooltip: { callbacks: { label: c => ` ${c.parsed.y.toFixed(2)} g CO₂ cumulative` } }
-    },
-    scales: {
-      x: { ticks:{color:lc.tick,font:{size:10},maxTicksLimit:10}, grid:{color:lc.grid} },
-      y: { ticks:{color:lc.tick,font:{size:10}}, grid:{color:lc.grid},
-           title:{display:true, text:'g CO₂ (cumulative)', color:lc.tick, font:{size:10}},
-           beginAtZero:true }
-    }
-  };
-
-  if (lineChart) {
-    lineChart.data = chartData;
-    lineChart.options.plugins.title.text = `${rangeLabel} — Total: ${totalLabel}`;
-    lineChart.update('none');
-  } else {
-    lineChart = new Chart(document.getElementById('lineChart'), { type:'line', data:chartData, options });
-  }
-}
-
-// Converts a cumulative CO2 total (grams) into a few widely-cited everyday
-// equivalents. The fridge comparison intentionally uses nimbus's own grid
-// intensity (from the current model data) rather than a separate reference
-// intensity, so it's an apples-to-apples "same grid, different appliance"
-// comparison.
-function renderReferenceFrames(totalGrams) {
-  const el = document.getElementById('ref-frames');
-  if (!el) return;
-
-  const gridIntensity = (lastData && lastData.models && lastData.models[0])
-    ? lastData.models[0].carbon_intensity_kg_per_kwh
-    : 0.198;
-
-  const miles = totalGrams / REF_CAR_G_PER_MILE;
-  const charges = totalGrams / REF_PHONE_CHARGE_G;
-  const fridgeGPerHour = (REF_FRIDGE_WATTS / 1000) * gridIntensity * 1000; // kW × kg/kWh × 1000 g/kg
-  const fridgeMinutes = fridgeGPerHour > 0 ? (totalGrams / fridgeGPerHour) * 60 : 0;
-  const treeMonths = totalGrams / (REF_TREE_KG_PER_MONTH * 1000);
-
-  const tiles = [
-    { label: 'Miles driven', value: fmt(miles, miles < 1 ? 3 : 1), unit: 'gas car (EPA avg)' },
-    { label: 'Phone charges', value: fmt(charges, charges < 1 ? 2 : 0), unit: 'full charges' },
-    { label: 'Fridge runtime', value: fmt(fridgeMinutes, fridgeMinutes < 1 ? 2 : 0), unit: 'minutes' },
-    { label: 'Tree absorption', value: fmt(treeMonths, 3), unit: 'tree-months' },
-  ];
-  el.innerHTML = tiles.map(t => `
-    <div class="stat">
-      <div class="stat-label">${t.label}</div>
-      <div class="stat-value">${t.value}</div>
-      <div class="stat-unit">${t.unit}</div>
-    </div>`).join('');
-}
-
-document.querySelectorAll('#time-range-tabs .range-tab').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('#time-range-tabs .range-tab').forEach(b=>b.classList.remove('active'));
-    btn.classList.add('active');
-    currentRange = btn.dataset.range;
-    if (lineChart) { lineChart.destroy(); lineChart = null; }
-    loadTimeSeries(currentRange);
+  const labels = pts.map(p => {
+    const d = new Date(p.t * 1000);
+    return win === '24h' ? d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})
+      : d.toLocaleDateString([], {month: 'short', day: 'numeric'}) + (win === '7d' ? ' ' + d.toLocaleTimeString([], {hour: '2-digit'}) : '');
   });
-});
+  const ds = {label: 'Cumulative CO₂ (g)', data: cum, borderWidth: 2, fill: true, tension: 0.25, pointRadius: 0, pointHoverRadius: 4};
+  if (lineChart) {
+    lineChart.data.labels = labels;
+    lineChart.data.datasets[0].data = cum;
+    styleChart();
+    return;
+  }
+  lineChart = new Chart(document.getElementById('lineChart'), {
+    type: 'line',
+    data: {labels, datasets: [ds]},
+    options: {
+      responsive: true,
+      interaction: {mode: 'index', intersect: false},
+      plugins: {
+        legend: {display: false},
+        tooltip: {callbacks: {label: c => ` ${grams(c.parsed.y)} CO₂ so far`}},
+      },
+      scales: {
+        x: {ticks: {font: {size: 10}, maxTicksLimit: 8, maxRotation: 0}, grid: {display: false}},
+        y: {beginAtZero: true, ticks: {font: {size: 10}}, grid: {}, title: {display: true, text: 'g CO₂, cumulative', font: {size: 10}}},
+      },
+    },
+  });
+  styleChart();
+}
+function parseStep(s) {
+  const h = /(\d+)h/.exec(s), m = /(\d+)m/.exec(s), x = /(\d+)s/.exec(s);
+  return (h ? +h[1] * 3600 : 0) + (m ? +m[1] * 60 : 0) + (x ? +x[1] : 0);
+}
+function renderReferenceFrames(g) {
+  const intensity = (data && data.models && data.models[0]) ? data.models[0].carbon_intensity_kg_per_kwh : 0.198;
+  const fridgeGPerHour = REF.fridgeW / 1000 * intensity * 1000;
+  const tiles = [
+    ['Miles driven', num(g / REF.carGPerMile, g / REF.carGPerMile < 1 ? 3 : 1), 'average gas car (EPA)'],
+    ['Phone charges', num(g / REF.phoneChargeG, 0), 'full smartphone charges'],
+    ['Fridge runtime', num(g / fridgeGPerHour, 1), 'hours, same grid'],
+    ['Tree absorption', num(g / (REF.treeKgPerMonth * 1000), 3), 'tree-months'],
+  ];
+  document.getElementById('ref-frames').innerHTML = tiles.map(t => tile(...t)).join('');
+}
 
-load();
-loadTimeSeries(currentRange);
+// ---- wiring ------------------------------------------------------------------
+document.querySelectorAll('#mode-seg button').forEach(b => b.addEventListener('click', () => {
+  mode = b.dataset.mode; saveView(); render();
+}));
+
+load().then(loadTimeSeries);
 setInterval(load, 30000);
-setInterval(() => loadTimeSeries(currentRange), 300000);
+setInterval(loadTimeSeries, 300000);
 </script>
 </body>
 </html>

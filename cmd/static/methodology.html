@@ -43,10 +43,12 @@
   This dashboard estimates the carbon footprint of large language model (LLM) inference
   running on the lab's Kubernetes cluster
   (<a href="https://github.com/boettiger-lab/k8s" target="_blank">boettiger-lab/k8s</a>) —
-  one row per GPU node serving a model. Today that is <code>cirrus</code> (two Quadro
-  RTX 8000s, shared with other GPU workloads) and <code>nimbus</code> (one GB10 DGX
-  Spark). All measurements are derived passively from existing telemetry — no
-  instrumentation of the LLM service is required.
+  one card per <strong>served model</strong>, whether it is running now or not. A
+  model is identified by its vLLM served name and the node whose API server exports its
+  metrics (<code>qwen@nimbus</code>, <code>deepseek-v4-flash@nimbus2</code>); a node that
+  switches models gets a card for each, and a model scaled to zero keeps its card, with
+  its record, for as long as Prometheus retains its data. All measurements are derived
+  passively from existing telemetry — no instrumentation of the LLM service is required.
 </p>
 
 <div class="callout">
@@ -65,25 +67,39 @@
 </p>
 <pre><code>DCGM_FI_DEV_POWER_USAGE{Hostname, namespace, pod, ...}  # watts, one series per GPU</code></pre>
 <p>
-  Power is summed per <strong>node</strong> — across both of cirrus's cards, and across
-  nimbus's single one:
+  Power is summed per <strong>node</strong>, and then attributed to whichever model is
+  serving on that node at that moment. A model is "serving" while its vLLM server is
+  exporting metrics (its <code>vllm:num_requests_running</code> gauge exists):
 </p>
-<pre><code>sum by (Hostname) (
-  avg_over_time(DCGM_FI_DEV_POWER_USAGE{Hostname=~"cirrus|nimbus"}[5m])
-)</code></pre>
+<pre><code>-- node GPU power, with a tensor-parallel worker's watts relabelled to its head
+sum by (node) (
+  label_replace(
+    label_replace(DCGM_FI_DEV_POWER_USAGE{Hostname=~"cirrus|nimbus|nimbus2|nimbus4|nimbus3"},
+                  "node", "$1", "Hostname", "(.*)"),
+    "node", "nimbus2", "Hostname", "nimbus4")
+)
+-- ... joined onto the model serving there
+  * on (node) group_right ()
+(max by (node, namespace, model_name) (vllm:num_requests_running{...}) * 0 + 1)</code></pre>
 <p>
-  The <code>avg_over_time(...[5m])</code> wrapper smooths short-lived spikes into a 5-minute
-  rolling average. This gives total GPU power in <strong>watts</strong> per node.
-  Measurements are scraped every 30 seconds.
+  The live figure wraps DCGM in <code>avg_over_time(...[5m])</code> to smooth short
+  spikes. Measurements are scraped every 30 seconds.
 </p>
 <div class="callout">
-  <p><strong>Shared GPUs are reported as an upper bound.</strong> DCGM attributes each
-  GPU's watts to whichever pod the pod-resources mapping picked, which cannot be split
-  fairly when a card is time-sliced across several tenants — and on nimbus it names an
-  unrelated pod entirely. So on any node whose GPUs are shared, the dashboard reports
-  <em>total node GPU power</em> and attributes it to the model, marking the card
-  <code>node-total power</code> (<code>power_is_node_total</code> in the API). The
-  model's own draw is somewhere below that number, never above it.</p>
+  <p><strong>Power is node-total, attributed by time.</strong> DCGM attributes each GPU's
+  watts to whichever pod its pod-resources mapping picked, which cannot be split fairly
+  when a card is time-sliced across several tenants — and on nimbus it names an unrelated
+  pod entirely. So the dashboard never reads per-pod power: it takes the node's total and
+  gives it to the model serving there. Where a node's GPUs are shared (cirrus), that is an
+  <em>upper bound</em> for the model. Time the node spends serving no model — cirrus's
+  speech-to-text, say — is attributed to nothing and stays out of every total.</p>
+</div>
+<div class="callout">
+  <p><strong>Tensor-parallel models span nodes.</strong> DeepSeek-V4-Flash runs TP2 across
+  nimbus2 and nimbus4. Only the head (nimbus2) exports vLLM metrics, but both ranks draw
+  power, so the node config lists <code>"power_hosts": ["nimbus2", "nimbus4"]</code> and
+  the worker's watts are relabelled to the head before the join. A host can be claimed by
+  only one node, so no joule is counted twice.</p>
 </div>
 <div class="callout">
   <p><strong>Limitation:</strong> We measure <em>GPU power only</em>. CPU, RAM, storage, and
@@ -102,15 +118,15 @@
 -- short enough to track our bursty single-user traffic without
 -- diluting a burst across mostly-idle time on either side of it):
 sum by (node, namespace, model_name) (
-  rate(vllm:generation_tokens_total{namespace=~"vllm",node=~"cirrus|nimbus"}[2m])
+  rate(vllm:generation_tokens_total{namespace=~"vllm",node=~"cirrus|nimbus|nimbus2|nimbus3"}[2m])
 )
 
 -- Input (prefill) tokens processed per second:
 sum by (node, namespace, model_name) (
-  rate(vllm:prompt_tokens_total{namespace=~"vllm",node=~"cirrus|nimbus"}[2m])
+  rate(vllm:prompt_tokens_total{namespace=~"vllm",node=~"cirrus|nimbus|nimbus2|nimbus3"}[2m])
 )</code></pre>
 <div class="callout">
-  <p><strong>Why the <code>node</code> filter matters:</strong> both models currently run
+  <p><strong>Why the <code>node</code> filter matters:</strong> every model runs
   in the same <code>vllm</code> namespace. Grouping by namespace alone would sum one
   node's tokens into the other's row while its watts stayed node-scoped, understating
   CO₂ per token. Every vLLM query here is filtered and grouped by node <em>and</em>
@@ -144,37 +160,43 @@ sum by (node, namespace, model_name) (
 <p>
   The <strong>CO₂ per token</strong> metric is only reported when total throughput (input +
   output) is at least 5 tok/s. Below this threshold the ratio is dominated by near-idle
-  power draw rather than the model's efficiency under real load. The dashboard cards break
-  down throughput into <em>Output tok/s</em>, <em>Input tok/s</em>, and <em>Total tok/s</em>
-  for transparency.
+  power draw rather than the model's efficiency under real load.
 </p>
 
-<h3>Token-weighted averaging</h3>
+<h3>Live and aggregate views</h3>
 <p>
-  The 24-hour and 7-day CO₂/token averages shown on each model card use a
-  <strong>token-weighted mean</strong> rather than an unweighted arithmetic mean.
-  Because CO₂/token is a ratio (power ÷ throughput), samples taken during low-throughput
-  periods produce extreme values — a model drawing 2,000 W at 5 tok/s yields
-  110 mg/token, versus 0.03 mg at 3,000 tok/s. An unweighted mean gives equal
-  influence to both, inflating the average by orders of magnitude.
+  A single toggle switches every card between two records:
 </p>
+<ul style="color:#cbd5e1; padding-left:1.5rem; margin:0.5rem 0 1rem;">
+  <li><strong>Live</strong> — the model's current state: 5-minute power, 2-minute token
+  rates, 15-minute request and latency figures, instant engine gauges. A model that is
+  not running shows its aggregate for the selected window instead, labelled as such
+  with when it was last seen.</li>
+  <li><strong>Aggregate</strong> — the model's record over the last 24 h, 7 d or 15 d,
+  recomputed from Prometheus every five minutes. 15 days is the cluster's Prometheus
+  retention, so it is the longest window offered; a model with no data in the chosen
+  window falls back to the longest window that has some.</li>
+</ul>
+<h3>How aggregates are computed</h3>
 <p>
-  The weighted formula:
+  Every aggregate is a ratio of totals over the window — never an average of ratios — so
+  a few minutes at 5 tok/s cannot outweigh hours at 3,000 tok/s. Energy integrates the
+  attributed power above at one-minute resolution:
 </p>
-<pre><code>avg_CO₂/token = Σ(CO₂_per_token_i × tokens_per_sec_i) / Σ(tokens_per_sec_i)</code></pre>
+<pre><code>energy_J       = sum_over_time((attributed_power)[W:1m]) × 60
+serving_s      = count_over_time((serving)[W:1m]) × 60
+tokens         = increase(vllm:prompt_tokens_total[W]) + increase(vllm:generation_tokens_total[W])
+mean power     = energy_J / serving_s
+CO₂/token      = energy_J / 3.6e6 × intensity / tokens          (all-in)
+CO₂/token work = energy_J_while_&gt;5_tok/s / 3.6e6 × intensity / tokens   (marginal)
+decode tok/s   = increase(generation_tokens) / increase(inter_token_latency_seconds_sum)
+uptime         = serving_s / (window, clipped to retention)</code></pre>
 <p>
-  This is equivalent to computing total CO₂ emitted divided by total tokens produced,
-  which is the physically meaningful quantity. A 30-second sample at 5 tok/s
-  (representing ~150 tokens) contributes proportionally less than a sample at 3,000 tok/s
-  (representing ~90,000 tokens). Models under sustained heavy load naturally converge to
-  their true operating efficiency.
-</p>
-<p>
-  Internally, samples are aggregated into <strong>hourly buckets</strong> (168 buckets
-  for 7 days), each storing the weighted sum and token sum for that hour. On startup,
-  the scraper backfills these buckets from 7 days of historical Prometheus data, so
-  the 24-hour and 7-day averages are immediately correct after a service restart
-  rather than starting from zero.
+  <strong>All-in CO₂/token</strong> counts every joule the model burned while loaded,
+  idle hosting included — what the model actually cost. <strong>Working</strong>
+  CO₂/token counts only minutes above 5 tok/s: the marginal cost of a token when the
+  model is busy. Both use the same token denominator. Nothing is held in memory, so a
+  restart loses nothing and needs no backfill.
 </p>
 
 <h2>Step 3 — Carbon Intensity</h2>
@@ -268,10 +290,9 @@ CO₂_mg/token = P_watts × intensity_kg/kWh × (1e6 mg/kg) / (3.6e6 J/kWh) / to
 ratio = frontier_watts / nrp_measured_watts</code></pre>
 <p>
   This formula is applied to each of our models using its <strong>actual observed</strong>
-  prompt and generation token rates. The comparison is shown as a plain-text watts bar on
-  each model card, visible only while the model is actively generating (24h-avg combined
-  tok/s above a small threshold) — not as a colored verdict, and separate from the
-  CO₂/token and J/token card tiles, which are always-rendered absolute measurements.
+  prompt and generation token rates while working (tokens over working time in the
+  selected window), against its measured working power — see
+  <a href="#where">where the comparison appears</a>.
 </p>
 
 <h3>Example: nimbus at typical light traffic</h3>
@@ -305,45 +326,27 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
 </div>
 
 <p>
-  Each card also displays the <strong>observed prompt token percentage</strong> — what
-  fraction of total tokens are input (prefill) vs output (decode), for transparency
-  about the workload driving the comparison.
+  Each card's aggregate view also shows tokens in and out and the mean tokens per
+  request, for transparency about the workload driving the comparison.
 </p>
 
-<h3>Dashboard visualizations</h3>
+<h3 id="where">Where the comparison appears</h3>
 <p>
-  The dashboard presents the frontier comparison in two ways, both shown only
-  while the model is actively generating (24h-avg combined tok/s > 1) — while
-  idle, neither is shown, since there is nothing to compare and idling low is
-  expected behavior for this hardware, not something to judge either way:
-</p>
-<ul style="color:#cbd5e1; padding-left:1.5rem; margin:0.5rem 0 1rem;">
-  <li><strong>Model card "N× less energy" metric:</strong> Shown only while actively
-  generating. Each model card shows how many times more power the commercial frontier
-  would require to serve the same tokens (e.g. "7.0× less energy"). This is
-  <code>frontier_watts / measured_watts</code>. There is no color judgment on this
-  number — it's informational, not a verdict.</li>
-  <li><strong>Power comparison bar (per card):</strong> Shown only while actively
-  generating. A horizontal bar comparing the node's measured watts against the frontier
-  equivalent (purple band), with a breakdown of idle floor vs. marginal power.</li>
-</ul>
-<p>
-  CO₂/token and J/token are both plain per-model card stats, not chart bars — a number
-  (with a 24h average alongside where available), or <code>—</code> when there isn't
-  enough throughput to make the ratio meaningful. Neither is colored by a comparative
-  scale: each node runs one active model at a time, and the handful of models on the
-  page are different sizes on different hardware, so coloring them against each other
-  would rank the GB10 against a pair of RTX 8000s as though that were a verdict.
-  Comparing them is left to the reader, with the node and its GPUs named on every card.
+  In the aggregate view, a card whose model did any work in the window shows one line —
+  "~N× less energy than a frontier-scale deployment (estimate)" — computed as
+  <code>frontier_watts / measured_working_watts</code>, with the frontier side fed the
+  model's own working-time prompt and generation rates. It is informational, not a
+  verdict, and is not colored. No per-model number on the page is colored against the
+  others either: the models are different sizes on different hardware, and ranking the
+  GB10s against a pair of RTX 8000s would present that as a judgment.
 </p>
 
 <h3>Energy per token (J/token)</h3>
 <p>
   <strong>J/token</strong> (joules per token) is a hardware- and grid-neutral measure of
-  energy spent per token, computed from 24-hour averages (the same window CO₂/token
-  uses):
+  energy spent per token over the selected window, all-in like CO₂/token:
 </p>
-<pre><code>J_per_token = power_watts_avg_24h / (prompt_tokens_per_sec_avg_24h + generation_tokens_per_sec_avg_24h)</code></pre>
+<pre><code>J_per_token = energy_J / (prompt_tokens + generation_tokens)</code></pre>
 <p>
   Unlike CO₂/token, this metric is independent of grid carbon intensity, making it
   directly comparable across models regardless of where they are hosted. J/token reflects
@@ -363,21 +366,12 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
   weights. A dense 31B model may therefore have higher J/token than a 397B MoE, because the
   MoE only activates ~60B parameters per token</li>
 </ul>
-<div class="callout">
-  <p><strong>Note:</strong> the J/token card tile only shows a value for models with
-  combined 24h-avg prompt+generation throughput above 0.1 tok/s (otherwise <code>—</code>).
-  There is no color judgment — lower is more energy per output, but is not itself
-  "better" or "worse" without knowing the workload.</p>
-</div>
-
 <h3>Live activity metrics</h3>
 <p>
-  Each model also gets a companion "Live Activity" card, shown alongside its
-  main carbon card, with real-time engine state read directly from vLLM and
-  DCGM rather than derived from carbon math. Unlike CO₂/token or J/token,
-  these are absolute engine-state readings
-  — a value of zero is exactly as meaningful as any other value, so none of
-  them are gated behind a minimum-throughput threshold:
+  Beside the carbon figures, each card reports the model's engine state and service
+  quality, read directly from vLLM and DCGM. Engine gauges are absolute readings — a
+  zero is as meaningful as any other value — so they are not gated on throughput.
+  Latency percentiles are gated on request count (below):
 </p>
 <table>
   <tr><th>Metric</th><th>Source</th><th>Notes</th></tr>
@@ -394,7 +388,25 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
     <td>Summed across all <code>finished_reason</code> values (stop, length,
     abort, error, repetition), rate over 15 minutes ×3600 — a genuine
     usage-volume counter, distinct from tokens/sec</td></tr>
-  <tr><td>MTP Accept</td><td><code>vllm:spec_decode_num_accepted_tokens_total</code>
+  <tr><td>TTFT, end-to-end latency, queue time</td><td><code>vllm:time_to_first_token_seconds</code>,
+    <code>vllm:e2e_request_latency_seconds</code>, <code>vllm:request_queue_time_seconds</code></td>
+    <td><code>histogram_quantile</code> over the 15-minute window (live) or the whole window
+    (aggregate). <strong>Withheld below 20 completed requests</strong>: on bursty
+    single-user traffic, a p95 of two requests is two data points dressed up as a
+    statistic. Values are interpolated within vLLM's histogram buckets, so treat them as
+    approximate</td></tr>
+  <tr><td>Prefix-cache hits</td><td><code>vllm:prefix_cache_hits_total</code> /
+    <code>vllm:prefix_cache_queries_total</code></td><td>Share of prompt tokens served
+    from the KV prefix cache. High on agentic traffic, where each turn resends the
+    conversation so far</td></tr>
+  <tr><td>Uptime, peak concurrency, tokens per request</td><td>Derived</td><td>Aggregate
+    only: share of the window the model was serving; most requests running at once
+    (1-minute resolution); mean prompt and generated tokens per completed request</td></tr>
+  <tr><td>Availability strip</td><td><code>vllm:num_requests_running</code>,
+    <code>vllm:generation_tokens_total</code></td><td>The window in equal intervals
+    (30 min for 24 h, 3 h for 7 d, 6 h for 15 d): generating, serving but idle, or not
+    serving</td></tr>
+  <tr><td>Spec-decode accept</td><td><code>vllm:spec_decode_num_accepted_tokens_total</code>
     / <code>vllm:spec_decode_num_draft_tokens_total</code></td><td>Speculative-decoding
     (MTP) draft-token acceptance rate, rate ratio over 15 minutes. Omitted
     entirely — not shown as 0% — for any model that isn't running speculative
@@ -412,10 +424,10 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
 <h3>Cumulative CO₂ emissions (time-series view)</h3>
 <p>
   The backend's timeseries endpoint queries the Prometheus range API at
-  adaptive resolution (5-minute steps for 24 h, hourly for 7 d, 6-hourly for
-  30 d) and returns <code>co2_grams_per_hour</code> at each step (already
-  computed server-side as <code>power_watts × 0.198</code>, our fixed
-  grid intensity). The dashboard then integrates that rate client-side using
+  adaptive resolution (5-minute steps for 24 h, hourly for 7 d, 2-hourly for
+  15 d) and returns <code>co2_grams_per_hour</code> at each step (computed
+  server-side as <code>attributed_power_watts × 0.198</code>, our fixed grid
+  intensity — so only GPU time spent serving an LLM is counted). The dashboard then integrates that rate client-side using
   the rectangle rule, running-summed over the selected window:
 </p>
 <pre><code>total_g = Σ (co2_grams_per_hour_i × step_hours)</code></pre>
@@ -444,16 +456,12 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
     frameworks show 62–137× energy vs single-turn (arXiv:2506.04301); production systems
     are likely lower but remain poorly characterized in the literature</li>
   <li>The eGRID intensity table in <code>internal/carbon/intensity.go</code> will be updated as new annual data is published</li>
-  <li>History (24h/7d averages, and the cumulative emissions chart) is in-memory only and
-    resets on every pod restart, backfilled only from Prometheus's own ~2-day retention.
-    Persistent storage across restarts is a possible future improvement, not yet implemented</li>
-  <li>Request latency (p50/p99 via <code>histogram_quantile</code>) is deliberately not
-    shown. Our traffic is bursty single-user generation — over a short window there
-    are often only one or two completed requests, and a quantile computed from that few
-    samples is not a meaningful percentile, just one or two data points dressed up as
-    statistics (the same structural problem that led to dropping the old CO₂/token
-    comparison chart). A longer-window mean (<code>sum/count</code> ratio, gated on a
-    minimum request count) could be added later if useful</li>
+  <li>History is bounded by Prometheus retention (15 days). A model unseen for longer drops
+    off the dashboard</li>
+  <li>A model is identified by its served name and head node. If the same name is reused
+    for a different checkpoint on the same node, their records merge</li>
+  <li>Energy and uptime integrate at one-minute resolution, so a model that serves for
+    less than a minute is not seen</li>
 </ul>
 <p>
   For a more complete lifecycle analysis including training, hardware manufacturing, and
