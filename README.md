@@ -24,8 +24,7 @@ named by `NODES_FILE` (a mounted ConfigMap on the cluster):
 [
   {"name": "cirrus",  "gpu_hardware": "Quadro RTX 8000", "gpu_count": 2},
   {"name": "nimbus",  "gpu_hardware": "NVIDIA GB10"},
-  {"name": "nimbus2", "gpu_hardware": "NVIDIA GB10", "gpu_count": 2,
-   "power_hosts": ["nimbus2", "nimbus4"]}
+  {"name": "nimbus2", "gpu_hardware": "NVIDIA GB10"}
 ]
 ```
 
@@ -51,8 +50,19 @@ Optional display names come from `MODELS_FILE`, keyed by served model name, or
 
 ```json
 {"qwen@nimbus": {"display_name": "Qwen3.8-Flash-Next NVFP4",
-                 "description": "MoE, MTP speculative decoding"}}
+                 "description": "MoE, MTP speculative decoding"},
+ "deepseek-v4-flash@nimbus2": {"display_name": "DeepSeek-V4-Flash-DSpark",
+                 "power_hosts": ["nimbus2", "nimbus4"], "gpu_count": 2}}
 ```
+
+A `model@node` entry may also carry **`power_hosts` and `gpu_count`**, overriding the
+node's for that one model. Use it for a tensor-parallel model whose node later serves
+something smaller. On the node, the extra rank would be charged to every later model
+on it. Remove it, and the pair's history loses that rank's energy, because history is
+recomputed from Prometheus on every scrape. On the model, both stay right for as long
+as Prometheus retains the series. The override must include all of the node's own
+hosts (it can add hosts, not drop them). The hosts it adds must not belong to any node,
+or to a model on another node. Startup refuses a config that would count a host twice.
 
 The legacy single-node environment variables (`NODE_NAME`, `NAMESPACE`,
 `GPU_HARDWARE`, `GPU_COUNT`, `CONTAINER`) still describe exactly one node.
@@ -65,7 +75,8 @@ The legacy single-node environment variables (`NODE_NAME`, `NAMESPACE`,
    keeps its card for as long as Prometheus (15 days here) retains its series.
 2. **GPU power** comes from [NVIDIA DCGM Exporter](https://github.com/NVIDIA/dcgm-exporter),
    summed per node over its `power_hosts`, and joined onto whichever model is
-   serving on that node at each minute. GPU time spent serving no model stays
+   serving on that node at each minute. A model's own `power_hosts` override
+   adds its extra hosts' power to that model alone, under the same join. GPU time spent serving no model stays
    out of every total.
 3. **Tokens, latency and engine state** come from vLLM's Prometheus metrics:
    token counters, TTFT / end-to-end / queue-time histograms (percentiles
