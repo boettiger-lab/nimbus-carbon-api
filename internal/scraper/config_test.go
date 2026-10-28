@@ -252,3 +252,24 @@ func TestValidateRejectsBadOverrides(t *testing.T) {
 		t.Errorf("same-node models sharing an extra host should be allowed: %v", err)
 	}
 }
+
+// TestModelUtilAveragesAllHosts: a tensor-parallel model's utilisation is the
+// mean over every rank's GPU, replacing (not adding to) its node's own figure.
+func TestModelUtilAveragesAllHosts(t *testing.T) {
+	c := overrideConfig()
+	q := c.attributedUtil("5m", c.presence())
+	if !strings.Contains(q, `avg(avg_over_time(DCGM_FI_DEV_GPU_UTIL{Hostname=~"nimbus2|nimbus4"}[5m]))`) {
+		t.Errorf("override should average the pair's hosts: %s", q)
+	}
+	if !strings.Contains(q, `"node", "nimbus2", "", ""), "model_name", "deepseek-v4-flash", "", "")`) {
+		t.Errorf("override not pinned to the overriding model: %s", q)
+	}
+	base := "(" + c.dcgmByNode("DCGM_FI_DEV_GPU_UTIL", "avg", "5m") + " * on (node) group_right () " + c.presence() + ")"
+	if !strings.HasSuffix(q, " or "+base+")") {
+		t.Errorf("node term must come last so the override wins: %s", q)
+	}
+	plain := clusterConfig()
+	if got := plain.attributedUtil("5m", plain.presence()); got != "("+plain.dcgmByNode("DCGM_FI_DEV_GPU_UTIL", "avg", "5m")+" * on (node) group_right () "+plain.presence()+")" {
+		t.Errorf("query changed without overrides: %s", got)
+	}
+}

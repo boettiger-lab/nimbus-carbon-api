@@ -307,7 +307,7 @@ func (s *Scraper) liveQueries() map[string]string {
 		"waiting":  c.vllm(`vllm:num_requests_waiting{%s}`),
 		"kv":       fmt.Sprintf(`avg by (%s) (vllm:kv_cache_usage_perc{%s}) * 100`, modelLabels, c.vllmSelector()),
 		"power":    c.attributedPower("5m", c.presence()),
-		"util":     fmt.Sprintf(`(%s * on (node) group_right () %s)`, c.dcgmByNode("DCGM_FI_DEV_GPU_UTIL", "avg", "5m"), c.presence()),
+		"util":     c.attributedUtil("5m", c.presence()),
 		"prompt":   c.vllm(`rate(vllm:prompt_tokens_total{%s}[2m])`),
 		"gen":      c.vllm(`rate(vllm:generation_tokens_total{%s}[2m])`),
 		"decode":   fmt.Sprintf(`%s / %s`, c.vllm(`rate(vllm:generation_tokens_total{%s}[2m])`), c.vllm(`rate(vllm:inter_token_latency_seconds_sum{%s}[2m])`)),
