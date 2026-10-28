@@ -65,8 +65,31 @@ func (c Config) active() string {
 
 // attributedPower is node GPU power (W) joined onto whichever model the
 // indicator marks on that node; indicator is presence() or active().
+//
+// A model with a power_hosts override (models.json, "model@node") also gets
+// its extra hosts' power, joined on (node, model_name) so it lands on that
+// model alone and only while it is marked. The terms are tagged with a `part`
+// label so `or` keeps all of them, then summed per model.
 func (c Config) attributedPower(rangeSel, indicator string) string {
-	return fmt.Sprintf(`(%s * on (node) group_right () %s)`, c.dcgmByNode("DCGM_FI_DEV_POWER_USAGE", "sum", rangeSel), indicator)
+	const metric = "DCGM_FI_DEV_POWER_USAGE"
+	base := fmt.Sprintf(`(%s * on (node) group_right () %s)`, c.dcgmByNode(metric, "sum", rangeSel), indicator)
+	overrides := c.modelOverrides()
+	if len(overrides) == 0 {
+		return base
+	}
+	terms := []string{fmt.Sprintf(`label_replace(%s, "part", "node", "", "")`, base)}
+	for i, o := range overrides {
+		model, node := o[0], o[1]
+		sel := fmt.Sprintf(`%s{Hostname=~%q}`, metric, alternation(c.extraHosts(model, node)))
+		if rangeSel != "" {
+			sel = fmt.Sprintf(`avg_over_time(%s[%s])`, sel, rangeSel)
+		}
+		power := fmt.Sprintf(`label_replace(label_replace(sum(%s), "node", %q, "", ""), "model_name", %q, "", "")`,
+			sel, node, model)
+		terms = append(terms, fmt.Sprintf(`label_replace((%s * on (node, model_name) group_right () %s), "part", "x%d", "", "")`,
+			power, indicator, i))
+	}
+	return fmt.Sprintf(`(sum by (%s) (%s))`, modelLabels, strings.Join(terms, " or "))
 }
 
 // quantile builds a per-model histogram quantile over window w, from rates

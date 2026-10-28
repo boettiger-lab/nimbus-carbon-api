@@ -153,3 +153,102 @@ func TestModelInfoPrefersNodeSpecific(t *testing.T) {
 		t.Errorf("info(qwen, cirrus) = %q", got)
 	}
 }
+
+// overrideConfig is the cluster after the TP2 pair was replaced by a single-GPU
+// model on nimbus2: the node owns only itself, and the pair's worker is carried
+// on the pair's own "model@node" entry so its history keeps both ranks.
+func overrideConfig() Config {
+	nodes, err := ParseNodes(`[
+	  {"name":"nimbus","gpu_hardware":"NVIDIA GB10"},
+	  {"name":"nimbus2","gpu_hardware":"NVIDIA GB10"}
+	]`)
+	if err != nil {
+		panic(err)
+	}
+	models, err := ParseModels(`{
+	  "deepseek-v4-flash@nimbus2": {"display_name":"DeepSeek","power_hosts":["nimbus2","nimbus4"],"gpu_count":2},
+	  "nemotron-3.5-super@nimbus2": {"display_name":"Nemotron"}
+	}`)
+	if err != nil {
+		panic(err)
+	}
+	return Config{Nodes: nodes, Models: models}
+}
+
+// TestModelPowerHostsOverride: the worker's watts go to the pair alone, joined
+// on the model, and the node term no longer reads nimbus4 at all.
+func TestModelPowerHostsOverride(t *testing.T) {
+	c := overrideConfig()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	q := c.attributedPower("5m", c.presence())
+	if !strings.HasPrefix(q, "(sum by (node, namespace, model_name) (") {
+		t.Errorf("override terms not summed per model: %s", q)
+	}
+	if !strings.Contains(q, `DCGM_FI_DEV_POWER_USAGE{Hostname=~"nimbus|nimbus2"}`) {
+		t.Errorf("node term should read only the nodes' own hosts: %s", q)
+	}
+	if !strings.Contains(q, `avg_over_time(DCGM_FI_DEV_POWER_USAGE{Hostname=~"nimbus4"}[5m])`) {
+		t.Errorf("extra host not read (smoothed): %s", q)
+	}
+	if !strings.Contains(q, `"node", "nimbus2", "", ""), "model_name", "deepseek-v4-flash", "", "")`) ||
+		!strings.Contains(q, "* on (node, model_name) group_right ()") {
+		t.Errorf("extra power not pinned to the overriding model: %s", q)
+	}
+	if strings.Count(q, `"part"`) != 2 {
+		t.Errorf("want one node term and one override term: %s", q)
+	}
+	if got := c.powerHostsFor("nemotron-3.5-super", "nimbus2"); len(got) != 1 || got[0] != "nimbus2" {
+		t.Errorf("nemotron should draw only nimbus2: %v", got)
+	}
+	if got := c.gpuCountFor("deepseek-v4-flash", "nimbus2"); got != 2 {
+		t.Errorf("deepseek gpu_count = %d, want 2", got)
+	}
+	if got := c.gpuCountFor("nemotron-3.5-super", "nimbus2"); got != 1 {
+		t.Errorf("nemotron gpu_count = %d, want 1", got)
+	}
+}
+
+// TestNoOverrideKeepsQueryShape: with no overrides the query is byte-identical
+// to the pre-override form, so existing deployments see no change.
+func TestNoOverrideKeepsQueryShape(t *testing.T) {
+	c := clusterConfig()
+	q := c.attributedPower("", c.presence())
+	want := "(" + c.dcgmByNode("DCGM_FI_DEV_POWER_USAGE", "sum", "") + " * on (node) group_right () " + c.presence() + ")"
+	if q != want {
+		t.Errorf("query changed without overrides:\n got %s\nwant %s", q, want)
+	}
+}
+
+// TestValidateRejectsBadOverrides: each way an override could double-count or
+// mean nothing is refused at startup.
+func TestValidateRejectsBadOverrides(t *testing.T) {
+	base, _ := ParseNodes(`[{"name":"nimbus2"},{"name":"nimbus4"}]`)
+	cases := map[string]string{
+		"bare key":           `{"deepseek": {"power_hosts":["nimbus2","nimbus9"]}}`,
+		"unknown node":       `{"deepseek@nimbus7": {"power_hosts":["nimbus7"]}}`,
+		"drops node host":    `{"deepseek@nimbus2": {"power_hosts":["nimbus9"]}}`,
+		"host owned by node": `{"deepseek@nimbus2": {"power_hosts":["nimbus2","nimbus4"]}}`,
+	}
+	for name, raw := range cases {
+		models, err := ParseModels(raw)
+		if err != nil {
+			t.Fatalf("%s: ParseModels: %v", name, err)
+		}
+		if err := (Config{Nodes: base, Models: models}).Validate(); err == nil {
+			t.Errorf("%s: expected a validation error", name)
+		}
+	}
+	// Two models on DIFFERENT nodes claiming one extra host could overlap.
+	two, _ := ParseNodes(`[{"name":"a"},{"name":"b"}]`)
+	models, _ := ParseModels(`{"m@a": {"power_hosts":["a","w"]}, "n@b": {"power_hosts":["b","w"]}}`)
+	if err := (Config{Nodes: two, Models: models}).Validate(); err == nil {
+		t.Error("expected an error when models on two nodes share an extra host")
+	}
+	// Two models on the SAME node may: only one serves there at a time.
+	models, _ = ParseModels(`{"m@a": {"power_hosts":["a","w"]}, "n@a": {"power_hosts":["a","w"]}}`)
+	if err := (Config{Nodes: two, Models: models}).Validate(); err != nil {
+		t.Errorf("same-node models sharing an extra host should be allowed: %v", err)
+	}
+}

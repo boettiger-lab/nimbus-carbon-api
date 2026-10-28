@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -41,10 +42,25 @@ type NodeConfig struct {
 	NodePower bool `json:"node_power,omitempty"`
 }
 
-// ModelInfo is optional display metadata for a served model name.
+// ModelInfo is optional metadata for a served model name.
 type ModelInfo struct {
 	DisplayName string `json:"display_name"`
 	Description string `json:"description,omitempty"`
+	// PowerHosts and GPUCount override the node's for this one model, and are
+	// only accepted on a "model@node" key. They exist because a node's
+	// hardware outlives any one model on it: nimbus2 served a tensor-parallel
+	// pair (head nimbus2, worker nimbus4) and then a single-GPU model. Put the
+	// pair's hosts on the node and the single model is charged for an idle
+	// worker; take them off and the pair's history (recomputed from
+	// Prometheus on every scrape) loses half its energy. On the model, each
+	// is right for as long as Prometheus remembers it.
+	//
+	// PowerHosts must include every one of the node's own PowerHosts (it adds
+	// hosts, it cannot drop them), and the hosts it adds must not belong to
+	// any node: a host claimed by a node and by a model would count twice
+	// whenever both serve.
+	PowerHosts []string `json:"power_hosts,omitempty"`
+	GPUCount   int      `json:"gpu_count,omitempty"`
 }
 
 // Config is the set of nodes this instance reports on, plus optional display
@@ -116,6 +132,96 @@ func ParseModels(raw string) (map[string]ModelInfo, error) {
 		return nil, fmt.Errorf("parsing model config: %w", err)
 	}
 	return models, nil
+}
+
+// Validate checks the model overrides against the node set. Call it once both
+// halves of the config are loaded.
+func (c Config) Validate() error {
+	claimed := make(map[string]bool)
+	for _, h := range c.powerHosts() {
+		claimed[h] = true
+	}
+	// Two models on the SAME node may share an extra host: only one model
+	// serves on a node at a time. Across nodes they could overlap.
+	extraBy := make(map[string]string)
+	for _, key := range sortedKeys(c.Models) {
+		mi := c.Models[key]
+		if len(mi.PowerHosts) == 0 && mi.GPUCount == 0 {
+			continue
+		}
+		model, node := splitID(key)
+		if model == "" || node == "" {
+			return fmt.Errorf("model %q: power_hosts/gpu_count need a \"model@node\" key", key)
+		}
+		n := c.node(node)
+		if n == nil {
+			return fmt.Errorf("model %q: node %q is not configured", key, node)
+		}
+		have := make(map[string]bool, len(mi.PowerHosts))
+		for _, h := range mi.PowerHosts {
+			have[h] = true
+		}
+		if len(mi.PowerHosts) > 0 {
+			for _, h := range n.PowerHosts {
+				if !have[h] {
+					return fmt.Errorf("model %q: power_hosts must include node %q's own host %q", key, node, h)
+				}
+			}
+		}
+		for _, h := range c.extraHosts(model, node) {
+			if prev, ok := extraBy[h]; ok && prev == node {
+				continue
+			}
+			if claimed[h] {
+				return fmt.Errorf("model %q: power host %q is already claimed (by a node or another model's node), so it would be counted twice", key, h)
+			}
+			extraBy[h] = node
+			claimed[h] = true
+		}
+	}
+	return nil
+}
+
+// powerHostsFor is the full list of hosts whose power belongs to model on
+// node: the model's override if it has one, else the node's.
+func (c Config) powerHostsFor(model, node string) []string {
+	if mi, ok := c.Models[model+"@"+node]; ok && len(mi.PowerHosts) > 0 {
+		return mi.PowerHosts
+	}
+	if n := c.node(node); n != nil {
+		return n.PowerHosts
+	}
+	return nil
+}
+
+// gpuCountFor is the model's GPU count override, else the node's.
+func (c Config) gpuCountFor(model, node string) int {
+	if mi, ok := c.Models[model+"@"+node]; ok && mi.GPUCount > 0 {
+		return mi.GPUCount
+	}
+	if n := c.node(node); n != nil {
+		return n.GPUCount
+	}
+	return 0
+}
+
+// extraHosts are the hosts a model override adds beyond its node's own.
+func (c Config) extraHosts(model, node string) []string {
+	n := c.node(node)
+	if n == nil {
+		return nil
+	}
+	own := make(map[string]bool, len(n.PowerHosts))
+	for _, h := range n.PowerHosts {
+		own[h] = true
+	}
+	var out []string
+	for _, h := range c.powerHostsFor(model, node) {
+		if !own[h] {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // info returns display metadata for a model served on a node, preferring an
@@ -193,4 +299,38 @@ func (c Config) powerHosts() []string {
 // configured namespaces AND the configured nodes.
 func (c Config) vllmSelector() string {
 	return fmt.Sprintf(`namespace=~%q,node=~%q`, alternation(c.namespaces()), alternation(c.nodeNames()))
+}
+
+// sortedKeys returns m's keys in order, so validation errors are deterministic.
+func sortedKeys(m map[string]ModelInfo) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// modelOverrides lists every (model, node) pair whose override adds hosts, in
+// a stable order.
+func (c Config) modelOverrides() [][2]string {
+	var out [][2]string
+	for _, key := range sortedKeys(c.Models) {
+		model, node := splitID(key)
+		if node != "" && len(c.extraHosts(model, node)) > 0 {
+			out = append(out, [2]string{model, node})
+		}
+	}
+	return out
+}
+
+// OverrideKeys names every "model@node" entry that adds power hosts, with the
+// full host list, for the startup log.
+func (c Config) OverrideKeys() []string {
+	var out []string
+	for _, o := range c.modelOverrides() {
+		out = append(out, fmt.Sprintf("%s@%s power_hosts=%v gpu_count=%d",
+			o[0], o[1], c.powerHostsFor(o[0], o[1]), c.gpuCountFor(o[0], o[1])))
+	}
+	return out
 }

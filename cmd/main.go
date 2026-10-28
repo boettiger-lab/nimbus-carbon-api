@@ -76,6 +76,12 @@ func loadNodes() scraper.Config {
 		}
 		cfg.Models = models
 	}
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	for _, key := range cfg.OverrideKeys() {
+		log.Printf("carbon-api model override: %s", key)
+	}
 	return cfg
 }
 
