@@ -3,6 +3,7 @@ package main
 import (
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -41,6 +42,7 @@ func main() {
 	mux.HandleFunc("/api/v1/models", handleModels)
 	mux.HandleFunc("/api/v1/carbon", handleModels) // the pre-2026-09 name, kept for old links
 	mux.HandleFunc("/api/v1/carbon/timeseries", handleTimeSeries)
+	mux.Handle("GET /api/v1/models/{id}/timeseries", modelTimeSeriesHandler(s))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 	})
@@ -187,6 +189,37 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 		body["retention_start"] = rs
 	}
 	writeJSON(w, body)
+}
+
+// modelSeriesSource is the slice of the scraper the drill-down endpoint uses,
+// so its routing can be tested without Prometheus.
+type modelSeriesSource interface {
+	ModelTimeSeries(id, rangeName string) (*scraper.ModelSeries, error)
+}
+
+// GET /api/v1/models/{id}/timeseries?range=3h|24h|7d|15d
+// One card's drill-down charts (see scraper.ModelSeries). range defaults to
+// 24h; {id} is a card id from /api/v1/models, which is always URL-safe.
+func modelTimeSeriesHandler(src modelSeriesSource) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rng := r.URL.Query().Get("range")
+		if rng == "" {
+			rng = "24h"
+		}
+		out, err := src.ModelTimeSeries(r.PathValue("id"), rng)
+		switch {
+		case errors.Is(err, scraper.ErrUnknownRange):
+			http.Error(w, "range must be one of 3h, 24h, 7d, 15d", http.StatusBadRequest)
+			return
+		case errors.Is(err, scraper.ErrUnknownModel):
+			http.Error(w, "unknown model id", http.StatusNotFound)
+			return
+		case err != nil:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, out)
+	})
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

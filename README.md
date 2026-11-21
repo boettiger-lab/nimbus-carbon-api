@@ -114,6 +114,10 @@ card:
 - the availability strip takes the higher state at each step; first seen is the
   earliest, last seen the latest.
 
+The dashboard shows hardware (`gpu_count`× `gpu_hardware`, plus "tensor-parallel"
+when the model spans several `power_hosts`), never node names: which interchangeable
+GB10 served a model is of no interest. The node fields stay in the API.
+
 `node`, `power_hosts`, `gpu_count` and `gpu_hardware` describe the card's primary
 member: the one serving now, else the one seen most recently. `nodes` and `model_names`
 list every member. `id` is the card key when that is URL-safe, else a slug of it plus a
@@ -183,8 +187,58 @@ docker push ghcr.io/boettiger-lab/nimbus-carbon-api:latest
 | Endpoint | Description |
 |---|---|
 | `GET /api/v1/models` | One record per model (card): `id`, `node` and `nodes`, `status` (`generating`/`idle`/`offline`), `live` (null when offline), `aggregates` per window, `availability` strip per window, first/last seen. `/api/v1/carbon` is an alias |
+| `GET /api/v1/models/{id}/timeseries?range=3h\|24h\|7d\|15d` | One card's charts over time (the dashboard's drill-down); `{id}` is a card `id` from `/api/v1/models`, `range` defaults to `24h`. See below |
 | `GET /api/v1/carbon/timeseries?range=24h\|7d\|15d` | Cluster-wide LLM power and CO2 over time (attributed power only) |
 | `GET /healthz` | Health check |
+
+### Per-model time series
+
+`GET /api/v1/models/{id}/timeseries?range=24h` returns:
+
+```json
+{
+  "id": "GLM-5.3-Flash-FP4-MTP-k-5-b12x-image-TP2-b0092d58",
+  "range": "24h", "start": 1795203360, "end": 1795289760,
+  "step_seconds": 120, "window": "5m",
+  "metrics": {
+    "power_watts":                [{"label": "GPU power", "points": [[1795289640, 84.1], ...]}],
+    "co2_grams_per_hour":         [{"label": "CO₂", "points": [...]}],
+    "tokens_per_sec":             [{"label": "Generation", ...}, {"label": "Prompt", ...}],
+    "joules_per_token":           [{"label": "J/token", ...}],
+    "requests":                   [{"label": "Running", ...}, {"label": "Waiting", ...}],
+    "kv_cache_percent":           [{"label": "KV cache", ...}],
+    "spec_decode_accept_percent": [{"label": "Accepted", ...}],
+    "prefix_cache_hit_percent":   [{"label": "Hit rate", ...}],
+    "latency_seconds":            [{"label": "E2E p50", ...}, {"label": "E2E p95", ...},
+                                   {"label": "E2E p99", ...}, {"label": "TTFT p50", ...}]
+  },
+  "errors": {"<query>": "<message>"}
+}
+```
+
+Points are `[unix seconds, value]`, oldest first. A step at which the model was not
+serving has no point (not a zero). Every chart name is always present; `errors`
+appears only if a query failed. An unknown id is a 404, an unknown range a 400.
+
+| Range | Step | Rate / average window |
+|---|---|---|
+| `3h` | 30 s | 2 m |
+| `24h` | 2 m | 5 m |
+| `7d` | 15 m | 15 m |
+| `15d` | 1 h | 1 h |
+
+It is stateless: 12 Prometheus range queries per request, one per metric, run
+concurrently. Each is one of the card queries' own builders (`attributedPower`,
+`rate`, `buckets`, ...) evaluated over the config's full node set, so power is
+attributed exactly as on the cards, gated pair-host claims included. The card's
+`model@node` members are then picked out of the results and combined as the card
+combines them: power, token rates and requests add; KV cache takes the fuller
+member; prefix-cache and spec-decode rates are recomputed from summed parts;
+latency percentiles come from the members' buckets summed `le` by `le`. CO₂ is
+power × the grid intensity. J/token is power over prompt + generated tokens/s,
+shown only above 5 tok/s, as on the live card. Requests are averaged over the
+window (mean concurrency). Unlike the cards, chart percentiles are not withheld
+below 20 requests: one point's window may hold only a few.
 
 ## License
 
