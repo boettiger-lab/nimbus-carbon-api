@@ -43,11 +43,14 @@
   This dashboard estimates the carbon footprint of large language model (LLM) inference
   running on the lab's Kubernetes cluster
   (<a href="https://github.com/boettiger-lab/k8s" target="_blank">boettiger-lab/k8s</a>) —
-  one card per <strong>served model</strong>, whether it is running now or not. A
-  model is identified by its vLLM served name and the node whose API server exports its
-  metrics (<code>qwen@nimbus</code>, <code>deepseek-v4-flash@nimbus2</code>); a node that
-  switches models gets a card for each, and a model scaled to zero keeps its card, with
-  its record, for as long as Prometheus retains its data. All measurements are derived
+  one card per <strong>served model</strong>, whether it is running now or not. Power is
+  attributed per vLLM served name and the node whose API server exports its metrics
+  (<code>qwen@nimbus</code>, <code>deepseek-v4-flash@nimbus2</code>), and those records
+  are then combined into one card per model: the same model served on two nodes is one
+  card, with energy, tokens and requests summed, ratios recomputed from the sums, and
+  latency percentiles taken from the combined histograms. A node that switches models
+  gets a card for each, and a model scaled to zero keeps its card, with its record, for
+  as long as Prometheus retains its data. All measurements are derived
   passively from existing telemetry — no instrumentation of the LLM service is required.
 </p>
 
@@ -100,6 +103,11 @@ sum by (node) (
   power, so the node config lists <code>"power_hosts": ["nimbus2", "nimbus4"]</code> and
   the worker's watts are relabelled to the head before the join. A host can be claimed by
   only one node, so no joule is counted twice.</p>
+  <p>A pair's worker can also be a node in its own right: nimbus3 serves single-box models
+  in rotation and is the worker of TP2 pairs headed on nimbus. The pair then claims
+  nimbus3 for itself, and nimbus3's watts go to the pair only at minutes when the pair is
+  serving <em>and</em> no model is serving on nimbus3. At every other minute they stay
+  with nimbus3's own model, so no minute is counted twice.</p>
 </div>
 <div class="callout">
   <p><strong>Limitation:</strong> We measure <em>GPU power only</em>. CPU, RAM, storage, and
@@ -458,8 +466,9 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
   <li>The eGRID intensity table in <code>internal/carbon/intensity.go</code> will be updated as new annual data is published</li>
   <li>History is bounded by Prometheus retention (15 days). A model unseen for longer drops
     off the dashboard</li>
-  <li>A model is identified by its served name and head node. If the same name is reused
-    for a different checkpoint on the same node, their records merge</li>
+  <li>A card is identified by its configured display name, else its served name. If the
+    same served name is reused for a different checkpoint without a display name of its
+    own, their records merge</li>
   <li>Energy and uptime integrate at one-minute resolution, so a model that serves for
     less than a minute is not seen</li>
 </ul>

@@ -46,7 +46,7 @@ serves out of the `vllm` namespace, so a namespace-only query would sum one
 node's tokens into another's.
 
 Optional display names come from `MODELS_FILE`, keyed by served model name, or
-`model@node` when a name is reused on two nodes:
+`model@node` when a name is reused on two nodes for different checkpoints:
 
 ```json
 {"qwen@nimbus": {"display_name": "Qwen3.8-Flash-Next NVFP4",
@@ -61,8 +61,63 @@ something smaller. On the node, the extra rank would be charged to every later m
 on it. Remove it, and the pair's history loses that rank's energy, because history is
 recomputed from Prometheus on every scrape. On the model, both stay right for as long
 as Prometheus retains the series. The override must include all of the node's own
-hosts (it can add hosts, not drop them). The hosts it adds must not belong to any node,
-or to a model on another node. Startup refuses a config that would count a host twice.
+hosts (it can add hosts, not drop them).
+
+A host it adds may be one of two kinds:
+
+- **A host no node owns** (`nimbus4`, only ever a TP worker): its power goes to the
+  model at every minute the model is serving.
+- **Another node's own host** (`nimbus3`, which serves its own models in rotation and
+  is also the worker rank of TP2 pairs headed on `nimbus`): its power goes to the model
+  only at minutes when the model is serving **and no model is serving on that host's
+  own node**. At any other minute it stays with its own node, as it would without the
+  override. The worker exports no vLLM metrics, so "nothing serving on nimbus3" is the
+  only sign that it is busy as a worker. Without the claim, nimbus3's watts during a
+  pair are counted nowhere.
+
+```json
+{"glm-5.3-flash@nimbus": {"display_name": "GLM-5.3-Flash",
+                          "power_hosts": ["nimbus", "nimbus3"], "gpu_count": 2}}
+```
+
+In PromQL, the second kind is its own term of the power join, gated with
+`unless on () vllm:num_requests_running{namespace="vllm",node="nimbus3"}`. The gate
+uses serving, not the 5 tok/s "active" test, so active energy splits the same way.
+Utilisation still averages over all of the model's hosts. Models on the same node may
+claim the same host (only one serves there at a time; `glm-5.3-flash@nimbus` and later
+`mimo-v2.6-flash@nimbus` can both list `nimbus3`). Models on two different nodes may
+not, because both could serve at once. Startup refuses a config that would count a host
+twice.
+
+### One card per model
+
+The dashboard shows one card per **model**, not per node. Every `model@node` the
+service discovers gets a card key: its `display_name` from `MODELS_FILE` (an exact
+`model@node` entry is preferred over the bare name), or, with none, the served model
+name. All `model@node`s with the same key are one card. The same served name on
+`nimbus` and `nimbus3` is one card. A `model@node` entry with a display name of its own
+(a different checkpoint behind a reused served name) stays a separate card. Within a
+card:
+
+- energy, CO₂, tokens, requests, serving and active hours are summed, and every mean
+  and ratio (mean power, J/token, CO₂/token, tokens per request, decode speed,
+  prefix-cache and spec-decode rates) is recomputed from the sums. `covered_hours` is
+  the window and is not summed, so uptime is the card's serving time over the window
+  (capped at 100% if two nodes served at once);
+- peak concurrency is the larger member's peak;
+- latency percentiles are exact. The service fetches each histogram's buckets per
+  `model@node` and sums them per card, `le` by `le`. It then interpolates them with
+  Prometheus's own `histogram_quantile` algorithm. This runs in Go, not PromQL, because
+  which series form a card is decided by `MODELS_FILE`;
+- live state comes from the members serving now. If two are serving at once, their
+  rates and power add, KV cache shows the fuller one, and GPU utilisation is averaged;
+- the availability strip takes the higher state at each step; first seen is the
+  earliest, last seen the latest.
+
+`node`, `power_hosts`, `gpu_count` and `gpu_hardware` describe the card's primary
+member: the one serving now, else the one seen most recently. `nodes` and `model_names`
+list every member. `id` is the card key when that is URL-safe, else a slug of it plus a
+short hash, so it is stable across restarts.
 
 The legacy single-node environment variables (`NODE_NAME`, `NAMESPACE`,
 `GPU_HARDWARE`, `GPU_COUNT`, `CONTAINER`) still describe exactly one node.
@@ -70,14 +125,16 @@ The legacy single-node environment variables (`NODE_NAME`, `NAMESPACE`,
 ## How it works
 
 1. **Models** are discovered from vLLM's own metrics: anything exporting
-   `vllm:num_requests_running` on a configured node is a model, keyed
-   `model_name@node`. Nothing is listed by hand, and a model scaled to zero
-   keeps its card for as long as Prometheus (15 days here) retains its series.
+   `vllm:num_requests_running` on a configured node is a model, measured per
+   `model_name@node` and shown one card per model (see above). Nothing is
+   listed by hand, and a model scaled to zero keeps its card for as long as
+   Prometheus (15 days here) retains its series.
 2. **GPU power** comes from [NVIDIA DCGM Exporter](https://github.com/NVIDIA/dcgm-exporter),
    summed per node over its `power_hosts`, and joined onto whichever model is
    serving on that node at each minute. A model's own `power_hosts` override
-   adds its extra hosts' power to that model alone, under the same join. GPU time spent serving no model stays
-   out of every total.
+   adds its extra hosts' power to that model alone, under the same join (a host
+   that is another node's own only while that node serves nothing). GPU time
+   spent serving no model stays out of every total.
 3. **Tokens, latency and engine state** come from vLLM's Prometheus metrics:
    token counters, TTFT / end-to-end / queue-time histograms (percentiles
    withheld below 20 requests), KV-cache and prefix-cache use, and
@@ -125,7 +182,7 @@ docker push ghcr.io/boettiger-lab/nimbus-carbon-api:latest
 
 | Endpoint | Description |
 |---|---|
-| `GET /api/v1/models` | One record per model: `status` (`generating`/`idle`/`offline`), `live` (null when offline), `aggregates` per window, `availability` strip per window, first/last seen. `/api/v1/carbon` is an alias |
+| `GET /api/v1/models` | One record per model (card): `id`, `node` and `nodes`, `status` (`generating`/`idle`/`offline`), `live` (null when offline), `aggregates` per window, `availability` strip per window, first/last seen. `/api/v1/carbon` is an alias |
 | `GET /api/v1/carbon/timeseries?range=24h\|7d\|15d` | Cluster-wide LLM power and CO2 over time (attributed power only) |
 | `GET /healthz` | Health check |
 

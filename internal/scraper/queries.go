@@ -70,6 +70,15 @@ func (c Config) active() string {
 // its extra hosts' power, joined on (node, model_name) so it lands on that
 // model alone and only while it is marked. The terms are tagged with a `part`
 // label so `or` keeps all of them, then summed per model.
+//
+// An extra host that is another node's own host (nimbus3, the worker of a
+// pair headed on nimbus, but also a node serving its own models) gets a term
+// of its own, gated with `unless on ()` on ANY model serving on that node:
+// at a minute when its node serves something, the node term already gives
+// the host's watts to that model, so the pair's term must be empty. The gate
+// uses serving (presence), not the indicator, so active energy obeys the
+// same split. Extra hosts no node owns (nimbus4) keep the ungated term,
+// byte-identical to before this gate existed.
 func (c Config) attributedPower(rangeSel, indicator string) string {
 	const metric = "DCGM_FI_DEV_POWER_USAGE"
 	base := fmt.Sprintf(`(%s * on (node) group_right () %s)`, c.dcgmByNode(metric, "sum", rangeSel), indicator)
@@ -78,16 +87,27 @@ func (c Config) attributedPower(rangeSel, indicator string) string {
 		return base
 	}
 	terms := []string{fmt.Sprintf(`label_replace(%s, "part", "node", "", "")`, base)}
-	for i, o := range overrides {
-		model, node := o[0], o[1]
-		sel := fmt.Sprintf(`%s{Hostname=~%q}`, metric, alternation(c.extraHosts(model, node)))
+	// pinned is the hosts' summed power joined onto one model on one node.
+	pinned := func(hosts []string, model, node string) string {
+		sel := fmt.Sprintf(`%s{Hostname=~%q}`, metric, alternation(hosts))
 		if rangeSel != "" {
 			sel = fmt.Sprintf(`avg_over_time(%s[%s])`, sel, rangeSel)
 		}
 		power := fmt.Sprintf(`label_replace(label_replace(sum(%s), "node", %q, "", ""), "model_name", %q, "", "")`,
 			sel, node, model)
-		terms = append(terms, fmt.Sprintf(`label_replace((%s * on (node, model_name) group_right () %s), "part", "x%d", "", "")`,
-			power, indicator, i))
+		return fmt.Sprintf(`(%s * on (node, model_name) group_right () %s)`, power, indicator)
+	}
+	for i, o := range overrides {
+		model, node := o[0], o[1]
+		free, gated := c.splitExtras(model, node)
+		if len(free) > 0 {
+			terms = append(terms, fmt.Sprintf(`label_replace(%s, "part", "x%d", "", "")`, pinned(free, model, node), i))
+		}
+		for _, g := range gated {
+			gate := fmt.Sprintf(`vllm:num_requests_running{namespace=%q,node=%q}`, g.owner.Namespace, g.owner.Name)
+			terms = append(terms, fmt.Sprintf(`label_replace((%s unless on () %s), "part", "x%d-%s", "", "")`,
+				pinned(g.hosts, model, node), gate, i, g.owner.Name))
+		}
 	}
 	return fmt.Sprintf(`(sum by (%s) (%s))`, modelLabels, strings.Join(terms, " or "))
 }
@@ -119,18 +139,21 @@ func (c Config) attributedUtil(rangeSel, indicator string) string {
 	return fmt.Sprintf(`(%s or %s)`, strings.Join(terms, " or "), base)
 }
 
-// quantile builds a per-model histogram quantile over window w, from rates
-// (live) or increases (aggregate) — identical up to a constant that cancels.
-func (c Config) quantile(q float64, histogram, w string) string {
-	return fmt.Sprintf(`histogram_quantile(%g, sum by (le, %s) (rate(%s_bucket{%s}[%s])))`,
-		q, modelLabels, histogram, c.vllmSelector(), w)
+// buckets is a per-model histogram's bucket rates over window w, one series
+// per `le`. The quantile is NOT taken in PromQL: a card can span several
+// "model@node" series (see cardKey), and which ones is decided by models.json,
+// so the scraper sums the buckets per card and interpolates them itself with
+// Prometheus's own algorithm (histQuantile). For a one-node card the result
+// is what histogram_quantile would return. Rates rather than increases: the
+// two differ by a constant that cancels.
+func (c Config) buckets(histogram, w string) string {
+	return fmt.Sprintf(`sum by (le, %s) (rate(%s_bucket{%s}[%s]))`,
+		modelLabels, histogram, c.vllmSelector(), w)
 }
 
-// ratio divides two per-model counters' increases over w, scaled.
-func (c Config) ratio(num, den, w string, scale float64) string {
-	return fmt.Sprintf(`%g * %s / %s`, scale,
-		c.vllm(fmt.Sprintf(`increase(%s{%%s}[%s])`, num, w)),
-		c.vllm(fmt.Sprintf(`increase(%s{%%s}[%s])`, den, w)))
+// rate is a per-model counter rate over w.
+func (c Config) rate(counter, w string) string {
+	return c.vllm(fmt.Sprintf(`rate(%s{%%s}[%s])`, counter, w))
 }
 
 // increase is a per-model counter increase over w.

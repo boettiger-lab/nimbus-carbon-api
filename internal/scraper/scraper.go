@@ -5,6 +5,7 @@ import (
 	"log"
 	"math"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -14,10 +15,15 @@ import (
 
 // Everything here is computed from Prometheus on a timer; the service keeps no
 // history of its own, so a restart loses nothing and needs no backfill. The
-// unit of reporting is a MODEL (a vLLM served model name on the node whose API
-// server exports it), not a node: a node that switches models gets one card per
-// model, and a model that is scaled to 0 keeps its card, with aggregate stats,
-// for as long as Prometheus retains its series.
+// unit of reporting is a MODEL, not a node: a node that switches models gets
+// one card per model, and a model that is scaled to 0 keeps its card, with
+// aggregate stats, for as long as Prometheus retains its series.
+//
+// Every query is per "model@node" (a vLLM served name on the node whose API
+// server exports it): that is the grain at which power is attributed. Cards
+// are one level up: every "model@node" with the same cardKey (its configured
+// display name, else its served name) is folded into one card, so a model
+// served on nimbus one week and nimbus3 the next is one card, not two.
 
 // Live is a model's current state. Pointer fields are nil when there is
 // nothing to report (e.g. no requests completed in the latency window), which
@@ -93,13 +99,21 @@ type Availability struct {
 	States      []int `json:"states"`
 }
 
-// Model is one card on the dashboard.
+// Model is one card on the dashboard. A card may span several "model@node"
+// members (the same model served on several nodes); the single-valued
+// hardware fields (ModelName, Node, Namespace, PowerHosts, GPUHardware,
+// GPUCount, Description) describe its primary member: the one serving now,
+// else the one seen most recently. Nodes and ModelNames list every member.
 type Model struct {
-	ID          string   `json:"id"` // model@node
+	// ID is stable and URL-safe: the card key itself when it is URL-safe,
+	// else a slug of it plus a short hash (see cardID).
+	ID          string   `json:"id"`
 	ModelName   string   `json:"model_name"`
+	ModelNames  []string `json:"model_names"`
 	DisplayName string   `json:"display_name,omitempty"`
 	Description string   `json:"description,omitempty"`
 	Node        string   `json:"node"`
+	Nodes       []string `json:"nodes"`
 	Namespace   string   `json:"namespace"`
 	PowerHosts  []string `json:"power_hosts"`
 	GPUHardware string   `json:"gpu_hardware"`
@@ -150,10 +164,12 @@ type Scraper struct {
 	now         func() time.Time
 
 	mu        sync.RWMutex
-	live      map[string]*Live
-	aggs      map[string]map[string]*Aggregate    // window -> id -> agg
-	avail     map[string]map[string]*Availability // window -> id -> strip
-	seen      map[string]seen
+	live      map[string]*Live                    // card -> merged live state
+	liveIDs   map[string]bool                     // model@node members serving now
+	aggs      map[string]map[string]*Aggregate    // window -> card -> agg
+	aggIDs    map[string]bool                     // model@node members serving in any window
+	avail     map[string]map[string]*Availability // window -> card -> strip
+	seen      map[string]seen                     // model@node -> first/last seen
 	updated   time.Time
 	retention time.Time
 }
@@ -177,7 +193,9 @@ func newScraper(q querier, interval time.Duration, cfg Config) *Scraper {
 		windows:     DefaultWindows,
 		now:         time.Now,
 		live:        map[string]*Live{},
+		liveIDs:     map[string]bool{},
 		aggs:        map[string]map[string]*Aggregate{},
+		aggIDs:      map[string]bool{},
 		avail:       map[string]map[string]*Availability{},
 		seen:        map[string]seen{},
 	}
@@ -270,6 +288,246 @@ func (s *Scraper) batch(queries map[string]string) map[string]map[string]float64
 	return out
 }
 
+// histograms runs bucket queries (see Config.buckets) concurrently and keys
+// each result "model@node" and `le`: name -> id -> upper bound -> rate.
+func (s *Scraper) histograms(queries map[string]string) map[string]map[string]map[float64]float64 {
+	out := make(map[string]map[string]map[float64]float64, len(queries))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for name, expr := range queries {
+		wg.Add(1)
+		go func(name, expr string) {
+			defer wg.Done()
+			byID := map[string]map[float64]float64{}
+			res, err := s.client.Query(expr)
+			if err != nil {
+				log.Printf("scraper: %s query failed: %v", name, err)
+			}
+			for _, r := range res {
+				le, err := strconv.ParseFloat(r.Metric["le"], 64)
+				id := s.modelID(r.Metric)
+				if err != nil || id == "" || math.IsNaN(r.Value) || math.IsInf(r.Value, 0) {
+					continue
+				}
+				if byID[id] == nil {
+					byID[id] = map[float64]float64{}
+				}
+				byID[id][le] += r.Value
+			}
+			mu.Lock()
+			out[name] = byID
+			mu.Unlock()
+		}(name, expr)
+	}
+	wg.Wait()
+	return out
+}
+
+// --- cards ------------------------------------------------------------------
+
+// cardOf is the card a "model@node" id belongs to.
+func (s *Scraper) cardOf(id string) string {
+	model, node := splitID(id)
+	return s.cfg.cardKey(model, node)
+}
+
+// merge says how one field's per-"model@node" values fold into a card.
+type merge int
+
+const (
+	sumOf  merge = iota // additive: energy, tokens, requests, hours, rates
+	maxOf               // peaks, last seen
+	minOf               // first seen
+	meanOf              // a gauge two live members both report (GPU util)
+)
+
+// toCards folds per-"model@node" results into per-card ones, over the member
+// ids keep admits. Fields default to sumOf. Ratios are NOT merged here:
+// setRatio recomputes them from the summed numerator and denominator.
+func (s *Scraper) toCards(r map[string]map[string]float64, keep map[string]bool, kinds map[string]merge) map[string]map[string]float64 {
+	out := make(map[string]map[string]float64, len(r))
+	for name, byID := range r {
+		kind := kinds[name]
+		vals := map[string]float64{}
+		counts := map[string]int{}
+		for id, v := range byID {
+			if !keep[id] {
+				continue
+			}
+			k := s.cardOf(id)
+			prev, ok := vals[k]
+			switch {
+			case !ok:
+				vals[k] = v
+			case kind == maxOf:
+				vals[k] = math.Max(prev, v)
+			case kind == minOf:
+				vals[k] = math.Min(prev, v)
+			default:
+				vals[k] = prev + v
+			}
+			counts[k]++
+		}
+		if kind == meanOf {
+			for k := range vals {
+				vals[k] /= float64(counts[k])
+			}
+		}
+		out[name] = vals
+	}
+	return out
+}
+
+// histCards sums each histogram's buckets over a card's members, le by le —
+// exactly what `sum by (le)` would do in PromQL.
+func (s *Scraper) histCards(h map[string]map[string]map[float64]float64, keep map[string]bool) map[string]map[string]map[float64]float64 {
+	out := make(map[string]map[string]map[float64]float64, len(h))
+	for name, byID := range h {
+		byCard := map[string]map[float64]float64{}
+		for id, bk := range byID {
+			if !keep[id] {
+				continue
+			}
+			k := s.cardOf(id)
+			if byCard[k] == nil {
+				byCard[k] = map[float64]float64{}
+			}
+			for le, v := range bk {
+				byCard[k][le] += v
+			}
+		}
+		out[name] = byCard
+	}
+	return out
+}
+
+// setRatio writes scale × num/den per card into rc[name], wherever both
+// were reported and den > 0 (PromQL's division drops the same cases).
+func setRatio(rc map[string]map[string]float64, name, num, den string, scale float64) {
+	out := map[string]float64{}
+	for k, d := range rc[den] {
+		if n, ok := rc[num][k]; ok && d > 0 {
+			out[k] = scale * n / d
+		}
+	}
+	rc[name] = out
+}
+
+// latencyHistograms are the vLLM histograms whose percentiles a card shows.
+var latencyHistograms = map[string]string{
+	"ttft":  "vllm:time_to_first_token_seconds",
+	"e2e":   "vllm:e2e_request_latency_seconds",
+	"queue": "vllm:request_queue_time_seconds",
+}
+
+// percentiles are the fields taken from latencyHistograms.
+var percentiles = []struct {
+	field, hist string
+	q           float64
+}{
+	{"ttft50", "ttft", 0.5}, {"ttft95", "ttft", 0.95},
+	{"e2e50", "e2e", 0.5}, {"e2e95", "e2e", 0.95},
+	{"queue50", "queue", 0.5},
+}
+
+// histQueries is one bucket query per latency histogram over window w.
+func (c Config) histQueries(w string) map[string]string {
+	out := make(map[string]string, len(latencyHistograms))
+	for name, h := range latencyHistograms {
+		out[name] = c.buckets(h, w)
+	}
+	return out
+}
+
+// setPercentiles writes each latency percentile per card into rc, from the
+// card's summed buckets. A percentile of several nodes' requests is exact
+// this way: the buckets add, the percentiles would not.
+func setPercentiles(rc map[string]map[string]float64, hc map[string]map[string]map[float64]float64) {
+	for _, p := range percentiles {
+		out := map[string]float64{}
+		for k, bk := range hc[p.hist] {
+			if v, ok := histQuantile(p.q, bk); ok {
+				out[k] = v
+			}
+		}
+		rc[p.field] = out
+	}
+}
+
+// histQuantile is Prometheus's histogram_quantile for one classic histogram:
+// cumulative bucket counts (or rates) by upper bound, interpolated linearly
+// within the bucket the rank falls in. ok is false wherever Prometheus would
+// return NaN: no +Inf bucket, fewer than two buckets, no observations.
+func histQuantile(q float64, buckets map[float64]float64) (float64, bool) {
+	if len(buckets) < 2 || q < 0 || q > 1 {
+		return 0, false
+	}
+	ub := make([]float64, 0, len(buckets))
+	for le := range buckets {
+		ub = append(ub, le)
+	}
+	sort.Float64s(ub)
+	n := len(ub)
+	if !math.IsInf(ub[n-1], 1) {
+		return 0, false
+	}
+	// Counts are cumulative; force them monotonic, as Prometheus does, in
+	// case a scrape landed between two buckets' updates.
+	counts := make([]float64, n)
+	for i, le := range ub {
+		counts[i] = buckets[le]
+		if i > 0 && counts[i] < counts[i-1] {
+			counts[i] = counts[i-1]
+		}
+	}
+	total := counts[n-1]
+	if total <= 0 {
+		return 0, false
+	}
+	rank := q * total
+	b := sort.Search(n-1, func(i int) bool { return counts[i] >= rank })
+	if b == n-1 {
+		return ub[n-2], true
+	}
+	if b == 0 && ub[0] <= 0 {
+		return ub[0], true
+	}
+	start, end, count := 0.0, ub[b], counts[b]
+	if b > 0 {
+		start = ub[b-1]
+		count -= counts[b-1]
+		rank -= counts[b-1]
+	}
+	return start + (end-start)*(rank/count), true
+}
+
+// stripsByCard folds members' availability strips into one per card, taking
+// the higher state at every step (generating > serving > not serving).
+func (s *Scraper) stripsByCard(byID map[string]*Availability) map[string]*Availability {
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := map[string]*Availability{}
+	for _, id := range ids {
+		a, k := byID[id], s.cardOf(id)
+		m := out[k]
+		if m == nil {
+			cp := *a
+			cp.States = append([]int(nil), a.States...)
+			out[k] = &cp
+			continue
+		}
+		for i := range m.States {
+			if i < len(a.States) && a.States[i] > m.States[i] {
+				m.States[i] = a.States[i]
+			}
+		}
+	}
+	return out
+}
+
 func ptr(m map[string]float64, id string, digits int) *float64 {
 	v, ok := m[id]
 	if !ok {
@@ -308,60 +566,51 @@ func (s *Scraper) liveQueries() map[string]string {
 		"kv":       fmt.Sprintf(`avg by (%s) (vllm:kv_cache_usage_perc{%s}) * 100`, modelLabels, c.vllmSelector()),
 		"power":    c.attributedPower("5m", c.presence()),
 		"util":     c.attributedUtil("5m", c.presence()),
-		"prompt":   c.vllm(`rate(vllm:prompt_tokens_total{%s}[2m])`),
-		"gen":      c.vllm(`rate(vllm:generation_tokens_total{%s}[2m])`),
-		"decode":   fmt.Sprintf(`%s / %s`, c.vllm(`rate(vllm:generation_tokens_total{%s}[2m])`), c.vllm(`rate(vllm:inter_token_latency_seconds_sum{%s}[2m])`)),
-		"reqs":     c.vllm(`rate(vllm:request_success_total{%s}[15m])`) + " * 3600",
-		"ttft50":   c.quantile(0.5, "vllm:time_to_first_token_seconds", "15m"),
-		"e2e50":    c.quantile(0.5, "vllm:e2e_request_latency_seconds", "15m"),
-		"e2e95":    c.quantile(0.95, "vllm:e2e_request_latency_seconds", "15m"),
-		"queue50":  c.quantile(0.5, "vllm:request_queue_time_seconds", "15m"),
-		"prefix":   c.ratio("vllm:prefix_cache_hits_total", "vllm:prefix_cache_queries_total", "15m", 100),
-		"accept":   c.ratio("vllm:spec_decode_num_accepted_tokens_total", "vllm:spec_decode_num_draft_tokens_total", "15m", 100),
+		"prompt":   c.rate("vllm:prompt_tokens_total", "2m"),
+		"gen":      c.rate("vllm:generation_tokens_total", "2m"),
+		"itl":      c.rate("vllm:inter_token_latency_seconds_sum", "2m"),
+		"reqs":     c.rate("vllm:request_success_total", "15m") + " * 3600",
+		"hits":     c.rate("vllm:prefix_cache_hits_total", "15m"),
+		"lookups":  c.rate("vllm:prefix_cache_queries_total", "15m"),
+		"accepted": c.rate("vllm:spec_decode_num_accepted_tokens_total", "15m"),
+		"drafted":  c.rate("vllm:spec_decode_num_draft_tokens_total", "15m"),
 		"lastseen": fmt.Sprintf(`max by (%s) (timestamp(vllm:num_requests_running{%s}))`, modelLabels, c.vllmSelector()),
 	}
 }
 
+// liveKinds are the live fields that do not simply add across a card's
+// serving members. Normally one member serves at a time and these never
+// matter; if two serve at once, their rates and power add, the fuller KV
+// cache is shown, and GPU utilisation is averaged.
+var liveKinds = map[string]merge{"kv": maxOf, "util": meanOf, "lastseen": maxOf}
+
 func (s *Scraper) refreshLive() {
 	r := s.batch(s.liveQueries())
+	h := s.histograms(s.cfg.histQueries("15m"))
+	// The running gauge is exported for as long as the server is up, so it
+	// defines which members are live; a member that stopped a minute ago
+	// still has 15-minute rates, and must not add them to the card.
+	ids := make(map[string]bool, len(r["running"]))
+	for id := range r["running"] {
+		ids[id] = true
+	}
+	rc := s.toCards(r, ids, liveKinds)
+	setRatio(rc, "decode", "gen", "itl", 1)
+	setRatio(rc, "prefix", "hits", "lookups", 100)
+	setRatio(rc, "accept", "accepted", "drafted", 100)
+	setPercentiles(rc, s.histCards(h, ids))
+
 	intensity := carbon.BerkeleyIntensity
 	live := make(map[string]*Live)
-	// The running gauge is exported for as long as the server is up, so it
-	// defines which models are live.
-	for id, running := range r["running"] {
-		power := r["power"][id]
-		prompt, gen := r["prompt"][id], r["gen"][id]
-		l := &Live{
-			PowerWatts:             round(power, 1),
-			CO2GramsPerHour:        round(carbon.GramsPerHour(power, intensity), 2),
-			PromptTokensPerSec:     round(prompt, 1),
-			GenerationTokensPerSec: round(gen, 1),
-			RequestsRunning:        running,
-			RequestsWaiting:        r["waiting"][id],
-			KVCachePercent:         ptr(r["kv"], id, 1),
-			GPUUtilPercent:         ptr(r["util"], id, 1),
-			RequestsPerHour:        round(r["reqs"][id], 1),
-			TTFTP50Seconds:         quantilesIf(r["reqs"][id]/4, ptr(r["ttft50"], id, 3)),
-			E2EP50Seconds:          quantilesIf(r["reqs"][id]/4, ptr(r["e2e50"], id, 2)),
-			E2EP95Seconds:          quantilesIf(r["reqs"][id]/4, ptr(r["e2e95"], id, 2)),
-			QueueP50Seconds:        quantilesIf(r["reqs"][id]/4, ptr(r["queue50"], id, 3)),
-			PrefixHitPercent:       ptr(r["prefix"], id, 1),
-			SpecAcceptPercent:      ptr(r["accept"], id, 1),
-		}
-		if d, ok := r["decode"][id]; ok && d > 0 {
-			l.DecodeTokensPerSec = ptr(r["decode"], id, 1)
-		}
-		if tok := prompt + gen; tok > 5 && power > 0 {
-			v := round(carbon.MgPerToken(power, intensity, tok), 4)
-			l.CO2MgPerToken = &v
-		}
-		live[id] = l
+	for card := range rc["running"] {
+		live[card] = buildLive(rc, card, intensity)
 	}
 
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.live = live
+	s.liveIDs = ids
 	s.updated = now
 	for id, ts := range r["lastseen"] {
 		sn := s.seen[id]
@@ -374,6 +623,38 @@ func (s *Scraper) refreshLive() {
 		}
 		s.seen[id] = sn
 	}
+}
+
+// buildLive turns one card's merged live results into a Live.
+func buildLive(r map[string]map[string]float64, id string, intensity float64) *Live {
+	running := r["running"][id]
+	power := r["power"][id]
+	prompt, gen := r["prompt"][id], r["gen"][id]
+	l := &Live{
+		PowerWatts:             round(power, 1),
+		CO2GramsPerHour:        round(carbon.GramsPerHour(power, intensity), 2),
+		PromptTokensPerSec:     round(prompt, 1),
+		GenerationTokensPerSec: round(gen, 1),
+		RequestsRunning:        running,
+		RequestsWaiting:        r["waiting"][id],
+		KVCachePercent:         ptr(r["kv"], id, 1),
+		GPUUtilPercent:         ptr(r["util"], id, 1),
+		RequestsPerHour:        round(r["reqs"][id], 1),
+		TTFTP50Seconds:         quantilesIf(r["reqs"][id]/4, ptr(r["ttft50"], id, 3)),
+		E2EP50Seconds:          quantilesIf(r["reqs"][id]/4, ptr(r["e2e50"], id, 2)),
+		E2EP95Seconds:          quantilesIf(r["reqs"][id]/4, ptr(r["e2e95"], id, 2)),
+		QueueP50Seconds:        quantilesIf(r["reqs"][id]/4, ptr(r["queue50"], id, 3)),
+		PrefixHitPercent:       ptr(r["prefix"], id, 1),
+		SpecAcceptPercent:      ptr(r["accept"], id, 1),
+	}
+	if d, ok := r["decode"][id]; ok && d > 0 {
+		l.DecodeTokensPerSec = ptr(r["decode"], id, 1)
+	}
+	if tok := prompt + gen; tok > 5 && power > 0 {
+		v := round(carbon.MgPerToken(power, intensity, tok), 4)
+		l.CO2MgPerToken = &v
+	}
+	return l
 }
 
 // --- aggregates -----------------------------------------------------------
@@ -389,18 +670,21 @@ func (s *Scraper) aggregateQueries(w string) map[string]string {
 		"prompt":     c.increase("vllm:prompt_tokens_total", w),
 		"gen":        c.increase("vllm:generation_tokens_total", w),
 		"requests":   c.increase("vllm:request_success_total", w),
-		"decode":     c.ratio("vllm:generation_tokens_total", "vllm:inter_token_latency_seconds_sum", w, 1),
-		"ttft50":     c.quantile(0.5, "vllm:time_to_first_token_seconds", w),
-		"ttft95":     c.quantile(0.95, "vllm:time_to_first_token_seconds", w),
-		"e2e50":      c.quantile(0.5, "vllm:e2e_request_latency_seconds", w),
-		"e2e95":      c.quantile(0.95, "vllm:e2e_request_latency_seconds", w),
-		"queue50":    c.quantile(0.5, "vllm:request_queue_time_seconds", w),
-		"prefix":     c.ratio("vllm:prefix_cache_hits_total", "vllm:prefix_cache_queries_total", w, 100),
-		"accept":     c.ratio("vllm:spec_decode_num_accepted_tokens_total", "vllm:spec_decode_num_draft_tokens_total", w, 100),
+		"itl":        c.increase("vllm:inter_token_latency_seconds_sum", w),
+		"hits":       c.increase("vllm:prefix_cache_hits_total", w),
+		"lookups":    c.increase("vllm:prefix_cache_queries_total", w),
+		"accepted":   c.increase("vllm:spec_decode_num_accepted_tokens_total", w),
+		"drafted":    c.increase("vllm:spec_decode_num_draft_tokens_total", w),
 		"first_seen": overTime("min_over_time", fmt.Sprintf(`min by (%s) (timestamp(vllm:num_requests_running{%s}))`, modelLabels, c.vllmSelector()), w),
 		"last_seen":  overTime("max_over_time", fmt.Sprintf(`max by (%s) (timestamp(vllm:num_requests_running{%s}))`, modelLabels, c.vllmSelector()), w),
 	}
 }
+
+// aggKinds are the aggregate fields that do not simply add across a card's
+// members. Everything else (serving/active seconds, energy, tokens, requests
+// and the ratio parts) is summed, and buildAggregate recomputes every mean
+// and ratio from the sums. Peak concurrency is the larger member's peak.
+var aggKinds = map[string]merge{"peak": maxOf, "first_seen": minOf, "last_seen": maxOf}
 
 // retentionStart is the oldest sample Prometheus still holds, so a window
 // longer than retention reports its true coverage instead of a fake uptime.
@@ -448,6 +732,10 @@ func buildAggregate(w string, covered time.Duration, r map[string]map[string]flo
 		PrefixHitPercent:   ptr(r["prefix"], id, 1),
 		SpecAcceptPercent:  ptr(r["accept"], id, 1),
 	}
+	// covered is the window's length in retention, NOT summed over a card's
+	// members: uptime is the card's serving time over the window. Members
+	// serving one after another (the normal case) make that exact; two
+	// serving at once overstate it, hence the cap.
 	if covered > 0 {
 		a.UptimePercent = round(math.Min(100, 100*servingS/covered.Seconds()), 1)
 	}
@@ -479,6 +767,7 @@ func (s *Scraper) refreshAggregates() {
 
 	aggs := make(map[string]map[string]*Aggregate, len(s.windows))
 	avail := make(map[string]map[string]*Availability, len(s.windows))
+	aggIDs := map[string]bool{}
 	first := map[string]time.Time{}
 	last := map[string]time.Time{}
 
@@ -488,13 +777,28 @@ func (s *Scraper) refreshAggregates() {
 			covered = now.Sub(retention)
 		}
 		r := s.batch(s.aggregateQueries(win.Name))
-		byID := map[string]*Aggregate{}
-		for id := range r["serving_s"] {
-			if a := buildAggregate(win.Name, covered, r, id, intensity); a != nil {
-				byID[id] = a
+		h := s.histograms(s.cfg.histQueries(win.Name))
+		// Only members that served in the window count toward a card, as
+		// before cards existed: tokens with no serving time had no record.
+		ids := map[string]bool{}
+		for id, v := range r["serving_s"] {
+			if v > 0 {
+				ids[id] = true
+				aggIDs[id] = true
 			}
 		}
-		aggs[win.Name] = byID
+		rc := s.toCards(r, ids, aggKinds)
+		setRatio(rc, "decode", "gen", "itl", 1)
+		setRatio(rc, "prefix", "hits", "lookups", 100)
+		setRatio(rc, "accept", "accepted", "drafted", 100)
+		setPercentiles(rc, s.histCards(h, ids))
+		byCard := map[string]*Aggregate{}
+		for card := range rc["serving_s"] {
+			if a := buildAggregate(win.Name, covered, rc, card, intensity); a != nil {
+				byCard[card] = a
+			}
+		}
+		aggs[win.Name] = byCard
 		for id, ts := range r["first_seen"] {
 			if t := time.Unix(int64(ts), 0); first[id].IsZero() || t.Before(first[id]) {
 				first[id] = t
@@ -505,12 +809,13 @@ func (s *Scraper) refreshAggregates() {
 				last[id] = t
 			}
 		}
-		avail[win.Name] = s.availability(win, now)
+		avail[win.Name] = s.stripsByCard(s.availability(win, now))
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.aggs = aggs
+	s.aggIDs = aggIDs
 	s.avail = avail
 	s.retention = retention
 	for id, t := range first {
@@ -567,36 +872,61 @@ func (s *Scraper) availability(win Window, now time.Time) map[string]*Availabili
 
 // --- assembly -------------------------------------------------------------
 
-// Models returns one record per model seen in live state or in any window,
-// generating first, then idle, then offline by most recently seen.
+// Models returns one card per model (see cardKey) seen in live state or in
+// any window, generating first, then idle, then offline by most recently seen.
 func (s *Scraper) Models() []*Model {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	ids := map[string]bool{}
-	for id := range s.live {
-		ids[id] = true
+	cards := map[string]bool{}
+	for k := range s.live {
+		cards[k] = true
 	}
-	for _, byID := range s.aggs {
-		for id := range byID {
-			ids[id] = true
+	for _, byCard := range s.aggs {
+		for k := range byCard {
+			cards[k] = true
 		}
 	}
+	members := map[string][]string{}
+	addMember := func(id string) {
+		if k := s.cardOf(id); cards[k] {
+			for _, x := range members[k] {
+				if x == id {
+					return
+				}
+			}
+			members[k] = append(members[k], id)
+		}
+	}
+	for id := range s.liveIDs {
+		addMember(id)
+	}
+	for id := range s.aggIDs {
+		addMember(id)
+	}
 
-	out := make([]*Model, 0, len(ids))
-	for id := range ids {
-		model, nodeName := splitID(id)
+	out := make([]*Model, 0, len(cards))
+	for key := range cards {
+		ms := members[key]
+		sort.Strings(ms)
+		primary := s.primary(ms)
+		if primary == "" {
+			continue
+		}
+		model, nodeName := splitID(primary)
 		n := s.cfg.node(nodeName)
 		if n == nil {
 			continue
 		}
 		info := s.cfg.info(model, nodeName)
 		m := &Model{
-			ID:              id,
+			ID:              cardID(key),
 			ModelName:       model,
+			ModelNames:      distinct(ms, func(x string) string { name, _ := splitID(x); return name }),
 			DisplayName:     info.DisplayName,
 			Description:     info.Description,
 			Node:            n.Name,
+			Nodes:           distinct(ms, func(x string) string { _, node := splitID(x); return node }),
 			Namespace:       n.Namespace,
 			PowerHosts:      s.cfg.powerHostsFor(model, nodeName),
 			GPUHardware:     n.GPUHardware,
@@ -606,7 +936,7 @@ func (s *Scraper) Models() []*Model {
 			Availability:    map[string]*Availability{},
 			Status:          "offline",
 		}
-		if l, ok := s.live[id]; ok {
+		if l, ok := s.live[key]; ok {
 			cp := *l
 			m.Live = &cp
 			m.Status = "idle"
@@ -614,22 +944,23 @@ func (s *Scraper) Models() []*Model {
 				m.Status = "generating"
 			}
 		}
-		for w, byID := range s.aggs {
-			if a, ok := byID[id]; ok {
+		for w, byCard := range s.aggs {
+			if a, ok := byCard[key]; ok {
 				m.Aggregates[w] = a
 			}
 		}
-		for w, byID := range s.avail {
-			if a, ok := byID[id]; ok {
+		for w, byCard := range s.avail {
+			if a, ok := byCard[key]; ok {
 				m.Availability[w] = a
 			}
 		}
-		if sn, ok := s.seen[id]; ok {
-			if !sn.first.IsZero() {
+		for _, member := range ms {
+			sn := s.seen[member]
+			if !sn.first.IsZero() && (m.FirstSeen == nil || sn.first.Before(*m.FirstSeen)) {
 				f := sn.first
 				m.FirstSeen = &f
 			}
-			if !sn.last.IsZero() {
+			if !sn.last.IsZero() && (m.LastSeen == nil || sn.last.After(*m.LastSeen)) {
 				l := sn.last
 				m.LastSeen = &l
 			}
@@ -648,6 +979,35 @@ func (s *Scraper) Models() []*Model {
 		}
 		return a.ID < b.ID
 	})
+	return out
+}
+
+// primary picks the member whose hardware a card shows: the first (sorted)
+// member serving now, else the one seen most recently. Caller holds s.mu.
+func (s *Scraper) primary(sorted []string) string {
+	best := ""
+	for _, id := range sorted {
+		if s.liveIDs[id] {
+			return id
+		}
+		if best == "" || s.seen[id].last.After(s.seen[best].last) {
+			best = id
+		}
+	}
+	return best
+}
+
+// distinct maps ids through f and returns the distinct results, sorted.
+func distinct(ids []string, f func(string) string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, id := range ids {
+		if v := f(id); !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 

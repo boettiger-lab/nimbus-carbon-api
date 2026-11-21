@@ -224,12 +224,15 @@ func TestNoOverrideKeepsQueryShape(t *testing.T) {
 // TestValidateRejectsBadOverrides: each way an override could double-count or
 // mean nothing is refused at startup.
 func TestValidateRejectsBadOverrides(t *testing.T) {
-	base, _ := ParseNodes(`[{"name":"nimbus2"},{"name":"nimbus4"}]`)
+	base, _ := ParseNodes(`[{"name":"nimbus2"},{"name":"nimbus3"},{"name":"nimbus4"}]`)
 	cases := map[string]string{
-		"bare key":           `{"deepseek": {"power_hosts":["nimbus2","nimbus9"]}}`,
-		"unknown node":       `{"deepseek@nimbus7": {"power_hosts":["nimbus7"]}}`,
-		"drops node host":    `{"deepseek@nimbus2": {"power_hosts":["nimbus9"]}}`,
-		"host owned by node": `{"deepseek@nimbus2": {"power_hosts":["nimbus2","nimbus4"]}}`,
+		"bare key":        `{"deepseek": {"power_hosts":["nimbus2","nimbus9"]}}`,
+		"unknown node":    `{"deepseek@nimbus7": {"power_hosts":["nimbus7"]}}`,
+		"drops node host": `{"deepseek@nimbus2": {"power_hosts":["nimbus9"]}}`,
+		// A node's host claimed by models on two different nodes: both
+		// could serve while its own node is idle.
+		"node host on two nodes": `{"glm@nimbus2": {"power_hosts":["nimbus2","nimbus3"]},
+		                            "mimo@nimbus4": {"power_hosts":["nimbus4","nimbus3"]}}`,
 	}
 	for name, raw := range cases {
 		models, err := ParseModels(raw)
@@ -271,5 +274,142 @@ func TestModelUtilAveragesAllHosts(t *testing.T) {
 	plain := clusterConfig()
 	if got := plain.attributedUtil("5m", plain.presence()); got != "("+plain.dcgmByNode("DCGM_FI_DEV_GPU_UTIL", "avg", "5m")+" * on (node) group_right () "+plain.presence()+")" {
 		t.Errorf("query changed without overrides: %s", got)
+	}
+}
+
+// pairConfig is the cluster with nimbus3 a node of its own AND (withPair) the
+// worker of a TP2 pair headed on nimbus, next to the nimbus2+nimbus4 pair
+// whose worker is no node.
+func pairConfig(withPair bool) Config {
+	nodes, err := ParseNodes(`[
+	  {"name":"nimbus","gpu_hardware":"NVIDIA GB10"},
+	  {"name":"nimbus2","gpu_hardware":"NVIDIA GB10"},
+	  {"name":"nimbus3","gpu_hardware":"NVIDIA GB10"}
+	]`)
+	if err != nil {
+		panic(err)
+	}
+	raw := `{"deepseek-v4-flash@nimbus2": {"display_name":"DeepSeek","power_hosts":["nimbus2","nimbus4"],"gpu_count":2}`
+	if withPair {
+		raw += `, "glm-5.3-flash@nimbus": {"display_name":"GLM-5.3-Flash","power_hosts":["nimbus","nimbus3"],"gpu_count":2}`
+	}
+	models, err := ParseModels(raw + "}")
+	if err != nil {
+		panic(err)
+	}
+	return Config{Nodes: nodes, Models: models}
+}
+
+// deepseekGolden is attributedPower("", presence()) for pairConfig(false),
+// captured from the code BEFORE node-owned hosts could be claimed. Prometheus
+// computes every DeepSeek number from this expression, so while it is
+// byte-identical, DeepSeek's energy cannot have moved.
+const deepseekGolden = `(sum by (node, namespace, model_name) (label_replace((sum by (node) (label_replace(DCGM_FI_DEV_POWER_USAGE{Hostname=~"nimbus|nimbus2|nimbus3"}, "node", "$1", "Hostname", "(.*)")) * on (node) group_right () (max by (node, namespace, model_name) (vllm:num_requests_running{namespace=~"vllm",node=~"nimbus|nimbus2|nimbus3"}) * 0 + 1)), "part", "node", "", "") or label_replace((label_replace(label_replace(sum(DCGM_FI_DEV_POWER_USAGE{Hostname=~"nimbus4"}), "node", "nimbus2", "", ""), "model_name", "deepseek-v4-flash", "", "") * on (node, model_name) group_right () (max by (node, namespace, model_name) (vllm:num_requests_running{namespace=~"vllm",node=~"nimbus|nimbus2|nimbus3"}) * 0 + 1)), "part", "x0", "", "")))`
+
+// TestDeepseekAttributionUnchanged: the nimbus2+nimbus4 override (nimbus4 is
+// no node) keeps its ungated term, and adding a pair that claims a node's
+// host leaves that term, and the node term, exactly as they were.
+func TestDeepseekAttributionUnchanged(t *testing.T) {
+	c := pairConfig(false)
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got := c.attributedPower("", c.presence()); got != deepseekGolden {
+		t.Errorf("DeepSeek's power expression changed:\n got %s\nwant %s", got, deepseekGolden)
+	}
+	withPair := pairConfig(true)
+	if err := withPair.Validate(); err != nil {
+		t.Fatalf("Validate with pair: %v", err)
+	}
+	q := withPair.attributedPower("", withPair.presence())
+	inner := strings.TrimSuffix(strings.TrimPrefix(deepseekGolden, "(sum by (node, namespace, model_name) ("), "))")
+	terms := strings.Split(inner, " or ")
+	if len(terms) != 2 {
+		t.Fatalf("golden split into %d terms", len(terms))
+	}
+	for _, term := range terms {
+		if !strings.Contains(q, term) {
+			t.Errorf("term lost or altered by the nimbus3 claim:\n%s\nin %s", term, q)
+		}
+	}
+	if strings.Contains(terms[1], "unless") {
+		t.Error("nimbus4 is no node; its term must not be gated")
+	}
+}
+
+// TestNodeHostClaimIsGated: nimbus3's watts go to the pair only while the
+// pair serves AND nothing serves on nimbus3; otherwise the node term keeps
+// them. Both halves are needed, or a minute of nimbus3 counts twice.
+func TestNodeHostClaimIsGated(t *testing.T) {
+	c := pairConfig(true)
+	for _, ind := range []string{c.presence(), c.active()} {
+		q := c.attributedPower("", ind)
+		want := `label_replace(((label_replace(label_replace(sum(DCGM_FI_DEV_POWER_USAGE{Hostname=~"nimbus3"}), "node", "nimbus", "", ""), "model_name", "glm-5.3-flash", "", "") * on (node, model_name) group_right () ` +
+			ind + `) unless on () vllm:num_requests_running{namespace="vllm",node="nimbus3"}), "part", "x1-nimbus3", "", "")`
+		if !strings.Contains(q, want) {
+			t.Errorf("gated nimbus3 term missing:\nwant %s\nin   %s", want, q)
+		}
+		// nimbus3 is still read by the node term, for its own models.
+		if !strings.Contains(q, `DCGM_FI_DEV_POWER_USAGE{Hostname=~"nimbus|nimbus2|nimbus3"}`) {
+			t.Errorf("node term no longer reads nimbus3: %s", q)
+		}
+	}
+	if q := c.attributedPower("5m", c.presence()); !strings.Contains(q, `sum(avg_over_time(DCGM_FI_DEV_POWER_USAGE{Hostname=~"nimbus3"}[5m]))`) {
+		t.Errorf("live gated term not smoothed: %s", q)
+	}
+	free, gated := c.splitExtras("glm-5.3-flash", "nimbus")
+	if len(free) != 0 || len(gated) != 1 || gated[0].owner.Name != "nimbus3" {
+		t.Errorf("glm splitExtras = %v, %+v", free, gated)
+	}
+	free, gated = c.splitExtras("deepseek-v4-flash", "nimbus2")
+	if len(free) != 1 || free[0] != "nimbus4" || len(gated) != 0 {
+		t.Errorf("deepseek splitExtras = %v, %+v", free, gated)
+	}
+}
+
+// TestValidateAllowsNodeHostClaim: nimbus3 claimed by two models on the SAME
+// head node (glm now, mimo later) is fine: only one serves on nimbus at once.
+// A model on another node claiming it too is not.
+func TestValidateAllowsNodeHostClaim(t *testing.T) {
+	c := pairConfig(true)
+	c.Models["mimo-v2.6-flash@nimbus"] = ModelInfo{PowerHosts: []string{"nimbus", "nimbus3"}, GPUCount: 2}
+	if err := c.Validate(); err != nil {
+		t.Errorf("same-node models claiming nimbus3: %v", err)
+	}
+	c.Models["other@nimbus2"] = ModelInfo{PowerHosts: []string{"nimbus2", "nimbus3"}}
+	if err := c.Validate(); err == nil {
+		t.Error("expected an error when a model on nimbus2 also claims nimbus3")
+	}
+}
+
+// TestCardKey: the same served name on two nodes is one card; a model@node
+// entry with its own display name is a card of its own; ids are URL-safe.
+func TestCardKey(t *testing.T) {
+	c := Config{Models: map[string]ModelInfo{
+		"qwen":            {DisplayName: "Qwen3 8B"},
+		"qwen@nimbus":     {DisplayName: "Qwen3.8-Flash-Next NVFP4"},
+		"q36-mtp@nimbus3": {Description: "no display name"},
+	}}
+	if a, b := c.cardKey("q36-mtp", "nimbus"), c.cardKey("q36-mtp", "nimbus3"); a != b || a != "q36-mtp" {
+		t.Errorf("q36-mtp on two nodes: %q vs %q", a, b)
+	}
+	if a, b := c.cardKey("qwen", "nimbus"), c.cardKey("qwen", "cirrus"); a == b {
+		t.Errorf("a different checkpoint behind a reused name must stay separate: %q", a)
+	}
+	if got := c.cardKey("qwen", "nimbus2"); got != "Qwen3 8B" {
+		t.Errorf("bare display name not used: %q", got)
+	}
+	if got := cardID("q36-mtp-stock"); got != "q36-mtp-stock" {
+		t.Errorf("URL-safe key should be its own id: %q", got)
+	}
+	id := cardID("Qwen3.8-Flash-Next NVFP4")
+	if !urlSafe.MatchString(id) || !strings.HasPrefix(id, "Qwen3.8-Flash-Next-NVFP4-") {
+		t.Errorf("display-name id not URL-safe: %q", id)
+	}
+	if cardID("Qwen3.8-Flash-Next NVFP4") != id {
+		t.Error("card id not stable")
+	}
+	if cardID("a b") == cardID("a/b") {
+		t.Error("keys that slug alike must still get distinct ids")
 	}
 }

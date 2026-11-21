@@ -3,6 +3,7 @@ package scraper
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"sort"
 	"strings"
@@ -56,9 +57,14 @@ type ModelInfo struct {
 	// is right for as long as Prometheus remembers it.
 	//
 	// PowerHosts must include every one of the node's own PowerHosts (it adds
-	// hosts, it cannot drop them), and the hosts it adds must not belong to
-	// any node: a host claimed by a node and by a model would count twice
-	// whenever both serve.
+	// hosts, it cannot drop them). An added host may be one no node owns
+	// (nimbus4, a TP worker and nothing else): its watts go to this model
+	// whenever it serves. Or it may be another node's own host (nimbus3,
+	// which serves its own models in rotation and is the worker of TP pairs
+	// headed on nimbus): then its watts go to this model only at minutes when
+	// this model serves AND no model serves on the host's own node, so a
+	// minute of that host is never counted twice. Models on two different
+	// nodes may not add the same host: both could serve at once.
 	PowerHosts []string `json:"power_hosts,omitempty"`
 	GPUCount   int      `json:"gpu_count,omitempty"`
 }
@@ -137,12 +143,12 @@ func ParseModels(raw string) (map[string]ModelInfo, error) {
 // Validate checks the model overrides against the node set. Call it once both
 // halves of the config are loaded.
 func (c Config) Validate() error {
-	claimed := make(map[string]bool)
-	for _, h := range c.powerHosts() {
-		claimed[h] = true
-	}
 	// Two models on the SAME node may share an extra host: only one model
-	// serves on a node at a time. Across nodes they could overlap.
+	// serves on a node at a time. Across nodes they could overlap, and the
+	// host would be counted for both. A host some node owns may be added
+	// (see ModelInfo.PowerHosts): attributedPower gates it on that node
+	// serving nothing, so it is never counted for its node and for a model
+	// at the same minute.
 	extraBy := make(map[string]string)
 	for _, key := range sortedKeys(c.Models) {
 		mi := c.Models[key]
@@ -169,14 +175,10 @@ func (c Config) Validate() error {
 			}
 		}
 		for _, h := range c.extraHosts(model, node) {
-			if prev, ok := extraBy[h]; ok && prev == node {
-				continue
-			}
-			if claimed[h] {
-				return fmt.Errorf("model %q: power host %q is already claimed (by a node or another model's node), so it would be counted twice", key, h)
+			if prev, ok := extraBy[h]; ok && prev != node {
+				return fmt.Errorf("model %q: power host %q is already claimed by a model on node %q; both could serve at once, so it would be counted twice", key, h, prev)
 			}
 			extraBy[h] = node
-			claimed[h] = true
 		}
 	}
 	return nil
@@ -222,6 +224,83 @@ func (c Config) extraHosts(model, node string) []string {
 		}
 	}
 	return out
+}
+
+// hostOwner returns the node whose own PowerHosts include h, or nil.
+func (c Config) hostOwner(h string) *NodeConfig {
+	for i := range c.Nodes {
+		for _, x := range c.Nodes[i].PowerHosts {
+			if x == h {
+				return &c.Nodes[i]
+			}
+		}
+	}
+	return nil
+}
+
+// splitExtras divides a model's extra hosts into those no node owns (free:
+// always the model's while it serves) and those another node owns (gated:
+// the model's only while that node serves nothing), the latter grouped by
+// owning node in first-seen order.
+func (c Config) splitExtras(model, node string) (free []string, gated []ownedHosts) {
+	idx := map[string]int{}
+	for _, h := range c.extraHosts(model, node) {
+		owner := c.hostOwner(h)
+		if owner == nil {
+			free = append(free, h)
+			continue
+		}
+		i, ok := idx[owner.Name]
+		if !ok {
+			i = len(gated)
+			idx[owner.Name] = i
+			gated = append(gated, ownedHosts{owner: *owner})
+		}
+		gated[i].hosts = append(gated[i].hosts, h)
+	}
+	return free, gated
+}
+
+// ownedHosts are a model's extra hosts that belong to another node.
+type ownedHosts struct {
+	owner NodeConfig
+	hosts []string
+}
+
+// cardKey is what one dashboard card stands for: the configured display name
+// of a model served on a node (info prefers "model@node" over the bare name),
+// else its served model name. Every "model@node" with the same key is one
+// card, so the same model on two nodes is one card, while a "model@node"
+// entry with its own display name (a different checkpoint behind a reused
+// served name) stays a card of its own.
+func (c Config) cardKey(model, node string) string {
+	if d := c.info(model, node).DisplayName; d != "" {
+		return d
+	}
+	return model
+}
+
+// urlSafe matches a card key that is already a fine URL path segment.
+var (
+	urlSafe   = regexp.MustCompile(`^[A-Za-z0-9._~-]+$`)
+	urlUnsafe = regexp.MustCompile(`[^A-Za-z0-9._~-]+`)
+)
+
+// cardID is the card's stable, URL-safe id. A key that is already URL-safe
+// (most served names) is its own id; any other (display names with spaces,
+// served names with a slash) becomes a slug plus a short hash of the key, so
+// two keys that slug alike still get distinct ids.
+func cardID(key string) string {
+	if urlSafe.MatchString(key) {
+		return key
+	}
+	slug := strings.Trim(urlUnsafe.ReplaceAllString(key, "-"), "-")
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	if slug == "" {
+		return fmt.Sprintf("%08x", h.Sum32())
+	}
+	return fmt.Sprintf("%s-%08x", slug, h.Sum32())
 }
 
 // info returns display metadata for a model served on a node, preferring an
