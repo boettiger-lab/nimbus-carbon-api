@@ -4,141 +4,240 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LLM Carbon Dashboard</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<!--
+  Layout, card and drill-down design adapted from the NRP LLM status page,
+  src/pages/llm-status.astro in https://github.com/djw8605/nrp-site
+  (https://nrp.ai/llm-status/). Adapted from it here: the status-dot,
+  stat-box and uptime-bar styles, the card -> overlay drill-down with its
+  range buttons, the Chart.js time-axis options, the health badge and the
+  "time ago" helper. That repository is distributed under this licence:
+
+  MIT License
+
+  Copyright (c) 2023 onWidget
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+-->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
 <style>
   :root {
     color-scheme: light;
-    --page:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink-2:#52514e; --muted:#898781;
-    --grid:#e1e0d9; --axis:#c3c2b7; --border:rgba(11,11,11,0.10);
-    --accent:#2a78d6; --accent-wash:rgba(42,120,214,.10);
-    --good:#0ca30c;
+    --page:#f9f9f7; --surface:#ffffff; --sunk:rgba(11,11,11,.035); --ink:#0b0b0b; --ink-2:#52514e; --muted:#76746e;
+    --grid:#e6e5df; --axis:#c3c2b7; --border:rgba(11,11,11,0.10); --border-2:rgba(11,11,11,0.18);
+    --accent:#2a78d6; --accent-wash:rgba(42,120,214,.09);
+    --good:#16a34a; --good-wash:rgba(22,163,74,.10);
+    --warn:#a16207; --warn-dot:#eab308; --warn-wash:rgba(234,179,8,.14);
+    --bad:#c62828; --bad-wash:rgba(198,40,40,.09);
+    --idle:#2a78d6;
     /* availability strip: ordinal blue ramp, "not serving" is the gridline */
     --strip-0:#e1e0d9; --strip-1:#86b6ef; --strip-2:#1c5cab;
+    /* chart lines */
+    --c1:#2a78d6; --c2:#d97706; --c3:#0f9d8a; --c4:#8b5cf6;
+    --shadow:0 4px 14px rgba(0,0,0,.08);
+    --backdrop:rgba(20,20,18,.45);
   }
   @media (prefers-color-scheme: dark) {
-    :root:where(:not([data-theme="light"])) {
+    :root:not([data-theme="light"]) {
       color-scheme: dark;
-      --page:#0d0d0d; --surface:#1a1a19; --ink:#ffffff; --ink-2:#c3c2b7; --muted:#898781;
-      --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
-      --accent:#3987e5; --accent-wash:rgba(57,135,229,.16);
+      --page:#0d0d0d; --surface:#181817; --sunk:rgba(255,255,255,.05); --ink:#ffffff; --ink-2:#c3c2b7; --muted:#97958e;
+      --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10); --border-2:rgba(255,255,255,0.20);
+      --accent:#5598e7; --accent-wash:rgba(85,152,231,.14);
+      --good:#4ade80; --good-wash:rgba(74,222,128,.12);
+      --warn:#facc15; --warn-dot:#facc15; --warn-wash:rgba(250,204,21,.12);
+      --bad:#f87171; --bad-wash:rgba(248,113,113,.12);
+      --idle:#5598e7;
       --strip-0:#2c2c2a; --strip-1:#184f95; --strip-2:#5598e7;
+      --c1:#5598e7; --c2:#f59e0b; --c3:#2dd4bf; --c4:#a78bfa;
+      --shadow:0 4px 14px rgba(0,0,0,.45);
+      --backdrop:rgba(0,0,0,.6);
     }
   }
   :root[data-theme="dark"] {
     color-scheme: dark;
-    --page:#0d0d0d; --surface:#1a1a19; --ink:#ffffff; --ink-2:#c3c2b7; --muted:#898781;
-    --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10);
-    --accent:#3987e5; --accent-wash:rgba(57,135,229,.16);
+    --page:#0d0d0d; --surface:#181817; --sunk:rgba(255,255,255,.05); --ink:#ffffff; --ink-2:#c3c2b7; --muted:#97958e;
+    --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,0.10); --border-2:rgba(255,255,255,0.20);
+    --accent:#5598e7; --accent-wash:rgba(85,152,231,.14);
+    --good:#4ade80; --good-wash:rgba(74,222,128,.12);
+    --warn:#facc15; --warn-dot:#facc15; --warn-wash:rgba(250,204,21,.12);
+    --bad:#f87171; --bad-wash:rgba(248,113,113,.12);
+    --idle:#5598e7;
     --strip-0:#2c2c2a; --strip-1:#184f95; --strip-2:#5598e7;
+    --c1:#5598e7; --c2:#f59e0b; --c3:#2dd4bf; --c4:#a78bfa;
+    --shadow:0 4px 14px rgba(0,0,0,.45);
+    --backdrop:rgba(0,0,0,.6);
   }
 
   *{box-sizing:border-box;margin:0;padding:0;}
-  body{background:var(--page);color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;min-height:100vh;line-height:1.4;}
+  html{-webkit-text-size-adjust:100%;}
+  body{background:var(--page);color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;min-height:100vh;line-height:1.4;overflow-x:hidden;}
+  body.modal-open{overflow:hidden;}
   a{color:inherit;}
   code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em;}
+  button{font:inherit;color:inherit;}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
 
-  header{padding:1rem 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:.75rem;flex-wrap:wrap;max-width:1400px;margin:0 auto;}
-  header h1{font-size:1.05rem;font-weight:600;}
-  .header-right{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;}
-  .link-btn,.icon-btn{font:inherit;font-size:.75rem;color:var(--ink-2);text-decoration:none;border:1px solid var(--border);border-radius:6px;padding:.3rem .65rem;background:transparent;cursor:pointer;}
-  .link-btn:hover,.icon-btn:hover{color:var(--ink);border-color:var(--axis);}
-  #status{font-size:.75rem;color:var(--muted);}
+  .wrap{max-width:1200px;margin:0 auto;padding:0 16px;}
 
-  main{padding:1.25rem 16px 2rem;max-width:1400px;margin:0 auto;}
+  /* ---- header ---- */
+  header{padding:2rem 0 1.25rem;text-align:center;}
+  header h1{font-size:1.6rem;font-weight:700;letter-spacing:-.01em;}
+  header .lede{color:var(--ink-2);font-size:.9rem;margin:.35rem auto .9rem;max-width:44rem;}
+  .nav{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:.9rem;}
+  .link-btn{font-size:.75rem;color:var(--ink-2);text-decoration:none;border:1px solid var(--border);border-radius:6px;padding:.3rem .65rem;background:transparent;cursor:pointer;}
+  .link-btn:hover{color:var(--ink);border-color:var(--border-2);}
 
-  /* Controls: one row above everything they filter */
-  .controls{display:flex;gap:.75rem 1.25rem;align-items:center;flex-wrap:wrap;margin-bottom:1rem;}
+  .health{display:inline-flex;align-items:center;gap:.5rem;font-size:.85rem;font-weight:500;padding:.3rem .8rem;border-radius:999px;background:var(--sunk);color:var(--ink-2);}
+  .health .hdot{width:8px;height:8px;border-radius:50%;background:var(--muted);animation:pulse 2s infinite;}
+  .health.ok{background:var(--good-wash);color:var(--good);} .health.ok .hdot{background:var(--good);animation:none;}
+  .health.warn{background:var(--warn-wash);color:var(--warn);} .health.warn .hdot{background:var(--warn-dot);animation:none;}
+  .health.bad{background:var(--bad-wash);color:var(--bad);} .health.bad .hdot{background:var(--bad);}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  @media (prefers-reduced-motion: reduce){*{animation:none!important;}}
+
+  .error{display:none;margin:0 0 1.25rem;padding:.8rem 1rem;border:1px solid var(--bad);border-radius:10px;background:var(--bad-wash);color:var(--bad);font-size:.85rem;text-align:center;}
+  .error.show{display:block;}
+
+  /* ---- controls + cluster summary ---- */
+  .controls{display:flex;gap:.6rem 1rem;align-items:center;flex-wrap:wrap;margin-bottom:.9rem;}
+  .controls-label{font-size:.75rem;color:var(--muted);margin-right:.4rem;}
+  .controls-note{font-size:.75rem;color:var(--muted);flex:1 1 240px;}
   .seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;padding:2px;background:var(--surface);}
-  .seg button{font:inherit;font-size:.8rem;border:0;background:transparent;color:var(--ink-2);padding:.35rem .8rem;border-radius:6px;cursor:pointer;}
-  .seg button[aria-pressed="true"]{background:var(--accent-wash);color:var(--ink);font-weight:600;}
-  .seg button:focus-visible,.icon-btn:focus-visible,.link-btn:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
-  .controls-label{font-size:.72rem;color:var(--muted);margin-right:.35rem;}
-  .controls-note{font-size:.75rem;color:var(--muted);flex:1 1 260px;}
+  .seg button{font-size:.8rem;border:0;background:transparent;color:var(--ink-2);padding:.3rem .75rem;border-radius:6px;cursor:pointer;}
+  .seg button[aria-pressed="true"]{background:var(--accent);color:#fff;font-weight:600;}
 
-  /* Summary tiles */
-  .summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.75rem;margin-bottom:1.5rem;}
-  .tile{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:.8rem 1rem;}
-  .tile-label{font-size:.75rem;color:var(--ink-2);margin-bottom:.25rem;}
-  .tile-value{font-size:1.5rem;font-weight:600;line-height:1.1;}
-  .tile-unit{font-size:.72rem;color:var(--muted);margin-top:.15rem;}
+  .summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,150px),1fr));gap:.6rem;margin-bottom:2rem;}
+  .tile{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:.7rem .9rem;min-width:0;}
+  .tile-label{font-size:.72rem;color:var(--ink-2);}
+  .tile-value{font-size:1.35rem;font-weight:650;line-height:1.2;font-variant-numeric:tabular-nums;}
+  .tile-unit{font-size:.7rem;color:var(--muted);}
 
-  .section-head{display:flex;align-items:baseline;justify-content:space-between;gap:.5rem;flex-wrap:wrap;margin:0 0 .75rem;}
-  .section-head h2{font-size:.9rem;font-weight:600;}
-  .section-head p{font-size:.75rem;color:var(--muted);}
+  /* ---- sections ---- */
+  .section{margin-bottom:2rem;}
+  .section-head{display:flex;align-items:center;gap:.5rem;margin-bottom:.8rem;width:100%;text-align:left;background:none;border:0;padding:0;}
+  button.section-head{cursor:pointer;}
+  .section-head h2{font-size:1.1rem;font-weight:650;}
+  .section-head .count{font-size:.85rem;color:var(--muted);}
+  .section-head .sdot{width:10px;height:10px;}
+  .section-head .chev{font-size:.7rem;color:var(--muted);transition:transform .15s;}
+  .section-head[aria-expanded="true"] .chev{transform:rotate(180deg);}
+  .section-note{font-size:.75rem;color:var(--muted);margin:-.4rem 0 .8rem;}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,320px),1fr));gap:1rem;}
+  .grid[hidden]{display:none;}
+  .empty{font-size:.85rem;color:var(--muted);padding:.5rem 0;}
 
-  /* One card per model */
-  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,360px),1fr));gap:1rem;margin-bottom:2rem;}
-  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1rem 1.1rem;display:flex;flex-direction:column;gap:.8rem;min-width:0;}
-  .card.offline{opacity:.92;}
+  /* ---- cards ---- */
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1rem;min-width:0;cursor:pointer;transition:box-shadow .2s,border-color .2s;display:flex;flex-direction:column;gap:.7rem;}
+  .card:hover{box-shadow:var(--shadow);border-color:var(--border-2);}
+  .card.offline{background:var(--page);}
   .card-top{display:flex;justify-content:space-between;align-items:flex-start;gap:.6rem;}
-  .card-title{font-size:1rem;font-weight:600;line-height:1.25;overflow-wrap:anywhere;}
-  .card-sub{font-size:.75rem;color:var(--ink-2);margin-top:.15rem;overflow-wrap:anywhere;}
-  .card-desc{font-size:.75rem;color:var(--muted);margin-top:.25rem;}
+  .card-title{font-size:.92rem;font-weight:600;line-height:1.3;overflow-wrap:anywhere;}
+  .card-hw{font-size:.75rem;color:var(--ink-2);margin-top:.15rem;}
 
-  .pill{display:inline-flex;align-items:center;gap:.35rem;font-size:.72rem;font-weight:600;white-space:nowrap;padding:.2rem .55rem;border-radius:999px;border:1px solid var(--border);color:var(--ink-2);}
-  .dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex-shrink:0;}
-  .pill.generating .dot{background:var(--good);}
-  .pill.offline .dot{background:transparent;border:1.5px solid var(--muted);}
+  .status{display:inline-flex;align-items:center;gap:.35rem;font-size:.75rem;font-weight:600;white-space:nowrap;flex-shrink:0;}
+  .status.generating{color:var(--good);} .status.idle{color:var(--idle);} .status.offline{color:var(--muted);}
+  .sdot{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+  .sdot.generating{background:var(--good);}
+  .status .sdot.generating{animation:pulse 2s infinite;}
+  .sdot.idle{background:var(--idle);}
+  .sdot.offline{background:transparent;border:1.5px solid var(--muted);}
 
-  .source{font-size:.72rem;color:var(--muted);border-left:2px solid var(--accent);padding-left:.5rem;}
-  .source.fallback{border-left-color:var(--axis);}
+  .stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.4rem;}
+  .stat{background:var(--sunk);border-radius:6px;padding:.4rem .5rem;min-width:0;}
+  .stat.carbon{background:var(--accent-wash);}
+  .stat-label{font-size:.68rem;color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .stat-value{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.88rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums;}
+  .stat-value small{font-size:.7rem;font-weight:400;color:var(--muted);}
+  .stat-value.na{color:var(--muted);font-weight:400;}
+  .stats-head{font-size:.7rem;color:var(--muted);margin-bottom:-.35rem;display:flex;justify-content:space-between;gap:.5rem;flex-wrap:wrap;}
 
-  .carbon{display:grid;grid-template-columns:repeat(3,1fr);gap:.5rem;}
-  .carbon .m{background:var(--accent-wash);border-radius:8px;padding:.55rem .65rem;min-width:0;}
-  .m-label{font-size:.68rem;color:var(--ink-2);}
-  .m-value{font-size:1.15rem;font-weight:600;line-height:1.2;}
-  .m-unit{font-size:.66rem;color:var(--muted);}
-  .carbon-extra{font-size:.72rem;color:var(--ink-2);margin-top:-.35rem;}
-
-  .perf{display:grid;grid-template-columns:1fr 1fr;gap:.1rem 1rem;font-size:.8rem;}
-  .perf div{display:flex;justify-content:space-between;gap:.5rem;padding:.28rem 0;border-bottom:1px solid var(--grid);min-width:0;}
-  .perf dt{color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-  .perf dd{font-weight:600;white-space:nowrap;font-variant-numeric:tabular-nums;}
-  .perf dd.na{color:var(--muted);font-weight:400;}
-
-  .strip-wrap{display:flex;flex-direction:column;gap:.3rem;}
-  .strip-head{display:flex;justify-content:space-between;font-size:.7rem;color:var(--muted);}
-  .strip{display:flex;gap:1px;height:18px;}
+  .strip{display:flex;gap:1px;height:16px;align-items:stretch;}
   .strip span{flex:1;border-radius:2px;background:var(--strip-0);min-width:1px;}
   .strip span[data-s="1"]{background:var(--strip-1);}
   .strip span[data-s="2"]{background:var(--strip-2);}
-  .strip span:hover{outline:1px solid var(--ink);outline-offset:0;}
+  .strip span:hover{outline:1px solid var(--ink);}
+  .strip-axis{display:flex;justify-content:space-between;font-size:.66rem;color:var(--muted);margin-top:.15rem;}
   .legend{display:flex;gap:.8rem;flex-wrap:wrap;font-size:.7rem;color:var(--ink-2);}
   .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:.3rem;vertical-align:-1px;}
-
   .card-foot{font-size:.72rem;color:var(--muted);display:flex;justify-content:space-between;gap:.5rem;flex-wrap:wrap;}
 
-  .chart-wrap{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:1.5rem;}
-  .chart-wrap canvas{max-height:240px;}
-  .ref-frames{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:.6rem;margin-top:1rem;}
+  /* ---- cumulative chart ---- */
+  .panel{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1rem;margin:1rem 0 2rem;}
+  .panel-head{display:flex;justify-content:space-between;align-items:baseline;gap:.5rem;flex-wrap:wrap;margin-bottom:.6rem;}
+  .panel-head h2{font-size:.95rem;font-weight:600;}
+  .panel-head p{font-size:.75rem;color:var(--muted);}
+  .chart-box{position:relative;height:220px;}
+  .ref-frames{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,130px),1fr));gap:.6rem;margin-top:1rem;}
 
-  .empty{font-size:.85rem;color:var(--muted);padding:1rem 0;}
+  /* ---- drill-down overlay ---- */
+  .overlay{position:fixed;inset:0;z-index:50;background:var(--backdrop);-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px);overflow-y:auto;display:flex;align-items:flex-start;justify-content:center;padding:3rem 16px;}
+  .overlay[hidden]{display:none;}
+  .sheet{background:var(--surface);border:1px solid var(--border);border-radius:14px;box-shadow:0 20px 50px rgba(0,0,0,.3);width:100%;max-width:960px;padding:1.25rem;min-width:0;}
+  .sheet-top{display:flex;justify-content:space-between;align-items:center;gap:.5rem;margin-bottom:.9rem;}
+  .back{background:none;border:0;color:var(--ink-2);font-size:.85rem;cursor:pointer;padding:.2rem 0;}
+  .back:hover{color:var(--ink);}
+  .sheet h2{font-size:1.35rem;font-weight:700;line-height:1.25;overflow-wrap:anywhere;}
+  .sheet .desc{font-size:.85rem;color:var(--ink-2);margin:.35rem 0 0;}
+  .sheet .meta{font-size:.78rem;color:var(--muted);margin:.35rem 0 1rem;overflow-wrap:anywhere;}
+  .sheet .stats{grid-template-columns:repeat(auto-fill,minmax(min(100%,135px),1fr));margin-bottom:.9rem;}
+  .sheet .stats-head{margin:0 0 .4rem;font-size:.75rem;}
+  .sheet .stat-value{white-space:normal;overflow-wrap:anywhere;}
+  .frontier{font-size:.78rem;color:var(--ink-2);margin:-.4rem 0 1rem;}
+  .range{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin:1.25rem 0 .9rem;}
+  .range > span{font-size:.8rem;color:var(--muted);}
+  .charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.8rem;}
+  .chart{background:var(--sunk);border-radius:8px;padding:.75rem;min-width:0;}
+  .chart.wide{grid-column:1/-1;}
+  .chart h3{font-size:.8rem;font-weight:600;margin-bottom:.4rem;}
+  .chart h3 small{font-weight:400;color:var(--muted);}
+  .chart .chart-box{height:180px;}
+  .chart.wide .chart-box{height:220px;}
+  .nodata{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:.8rem;color:var(--muted);}
+  .nodata[hidden]{display:none;}
+  .series-note{font-size:.72rem;color:var(--muted);margin-top:.8rem;}
+  @media (max-width:640px){
+    .charts{grid-template-columns:minmax(0,1fr);}
+    .overlay{padding:1rem 16px;}
+    .sheet{padding:1rem;}
+    header{padding-top:1.25rem;}
+    header h1{font-size:1.3rem;}
+  }
 
-  #tip{position:fixed;pointer-events:none;z-index:10;background:var(--surface);color:var(--ink);border:1px solid var(--border);border-radius:6px;padding:.35rem .55rem;font-size:.72rem;box-shadow:0 2px 8px rgba(0,0,0,.15);display:none;max-width:260px;}
-
-  footer{text-align:center;padding:1.5rem 16px 2rem;font-size:.72rem;color:var(--muted);}
+  footer{text-align:center;padding:1rem 16px 2rem;font-size:.72rem;color:var(--muted);border-top:1px solid var(--border);}
 </style>
 </head>
 <body>
-<header>
-  <h1>LLM carbon &amp; performance</h1>
-  <div class="header-right">
-    <a class="link-btn" href="/methodology">Methodology</a>
-    <a class="link-btn" href="https://github.com/boettiger-lab/nimbus-carbon-api" target="_blank" rel="noopener">GitHub</a>
-    <button class="icon-btn" id="theme-btn" type="button" aria-label="Toggle colour theme">Theme: auto</button>
-    <span id="status" role="status">loading…</span>
-  </div>
-</header>
+<div class="wrap">
+  <header>
+    <h1>LLM carbon &amp; performance</h1>
+    <p class="lede">GPU power, CO₂ and serving metrics for the models the lab hosts on its own hardware, measured from Prometheus.</p>
+    <div class="health" id="health" role="status"><span class="hdot" aria-hidden="true"></span><span id="health-text">Connecting…</span></div>
+    <nav class="nav">
+      <a class="link-btn" href="/methodology">Methodology</a>
+      <a class="link-btn" href="https://github.com/boettiger-lab/nimbus-carbon-api" target="_blank" rel="noopener">GitHub</a>
+      <button class="link-btn" id="theme-btn" type="button" aria-label="Toggle colour theme">Theme: auto</button>
+    </nav>
+  </header>
 
-<main>
+  <div class="error" id="error" role="alert"></div>
+
   <div class="controls">
-    <div>
-      <span class="controls-label" id="mode-label">View</span>
-      <div class="seg" id="mode-seg" role="group" aria-labelledby="mode-label">
-        <button type="button" data-mode="live">Live</button>
-        <button type="button" data-mode="aggregate">Aggregate</button>
-      </div>
-    </div>
     <div>
       <span class="controls-label" id="win-label">Window</span>
       <div class="seg" id="win-seg" role="group" aria-labelledby="win-label"></div>
@@ -148,45 +247,64 @@
 
   <div class="summary" id="summary"></div>
 
-  <div class="section-head">
-    <h2>Models</h2>
-    <p>One card per served model. Power is node GPU power while the model is serving; a tensor-parallel model sums every node it spans.</p>
-  </div>
-  <div class="cards" id="cards"><p class="empty">Loading…</p></div>
+  <div id="models"><p class="empty">Loading…</p></div>
 
-  <div class="chart-wrap">
-    <div class="section-head">
-      <h2 id="chart-title">Cumulative LLM CO₂</h2>
-      <p id="chart-total"></p>
+  <section class="panel" aria-labelledby="cum-title">
+    <div class="panel-head">
+      <h2 id="cum-title">Cumulative LLM CO₂</h2>
+      <p id="cum-total"></p>
     </div>
-    <canvas id="lineChart" aria-label="Cumulative CO2 emitted by LLM serving over the selected window"></canvas>
+    <div class="chart-box"><canvas id="cum-chart" aria-label="Cumulative CO2 emitted by LLM serving over the selected window"></canvas></div>
     <div class="ref-frames" id="ref-frames"></div>
-  </div>
-</main>
+  </section>
+</div>
 
-<div id="tip" role="tooltip"></div>
+<div class="overlay" id="overlay" hidden>
+  <div class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+    <div class="sheet-top">
+      <button class="back" id="back" type="button">← Back</button>
+      <span id="sheet-status"></span>
+    </div>
+    <div id="sheet-head"></div>
+    <div class="range">
+      <span id="range-label">Time range</span>
+      <div class="seg" id="range-seg" role="group" aria-labelledby="range-label"></div>
+    </div>
+    <div class="charts" id="charts"></div>
+    <p class="series-note" id="series-note"></p>
+  </div>
+</div>
 
 <footer>
   Data from the cluster's own Prometheus (vLLM metrics and DCGM GPU power) ·
   grid intensity: <a href="https://www.epa.gov/egrid" target="_blank" rel="noopener">EPA eGRID 2022</a>, CAMX ·
-  <a href="/methodology">Methodology &amp; references</a> · live data refreshes every 30 s, aggregates every 5 min
+  <a href="/methodology">Methodology &amp; references</a> · refreshes every 30 s ·
+  layout after the <a href="https://nrp.ai/llm-status/" target="_blank" rel="noopener">NRP LLM status page</a>
 </footer>
 
 <script>
 const API = '/api/v1/models';
 const TS_API = '/api/v1/carbon/timeseries';
+const RANGES = ['3h', '24h', '7d', '15d'];
+// An offline model last seen this recently counts as "down" in the health
+// pill: it stopped, it was not retired weeks ago.
+const DOWN_WITHIN_MS = 30 * 60 * 1000;
 
 // ---- persisted view state (URL hash wins, then localStorage) --------------
 function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 function recall(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
-const hash = new URLSearchParams(location.hash.slice(1));
-let mode = hash.get('mode') || recall('carbon.mode') || 'live';
-let win = hash.get('window') || recall('carbon.window') || '7d';
-let data = null, lineChart = null;
+const hash0 = new URLSearchParams(location.hash.slice(1));
+let win = hash0.get('window') || recall('carbon.window') || '7d';
+let openId = hash0.get('model') || null;
+let range = '24h';
+let data = null, cumChart = null, offlineOpen = false;
+let charts = {}, lastFocus = null, sheetTimer = null, seriesSeq = 0;
 
-function saveView() {
-  store('carbon.mode', mode); store('carbon.window', win);
-  history.replaceState(null, '', `#mode=${mode}&window=${win}`);
+function writeHash() {
+  const h = new URLSearchParams();
+  h.set('window', win);
+  if (openId) h.set('model', openId);
+  history.replaceState(null, '', '#' + h.toString());
 }
 
 // ---- theme: auto -> light -> dark ----------------------------------------
@@ -195,16 +313,15 @@ function applyTheme(t) {
   if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
   else delete document.documentElement.dataset.theme;
   themeBtn.textContent = 'Theme: ' + (t || 'auto');
-  if (lineChart) styleChart();
+  restyleCharts();
 }
 let theme = recall('carbon.theme') || '';
-applyTheme(theme);
 themeBtn.addEventListener('click', () => {
   theme = theme === '' ? 'light' : theme === 'light' ? 'dark' : '';
   store('carbon.theme', theme);
   applyTheme(theme);
 });
-matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (lineChart) styleChart(); });
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', restyleCharts);
 
 // ---- formatting ------------------------------------------------------------
 const NA = '—';
@@ -230,19 +347,36 @@ function grams(g) {
   if (!isNum(g)) return NA;
   return g >= 1000 ? (g / 1000).toFixed(2) + ' kg' : g.toFixed(g < 10 ? 2 : 1) + ' g';
 }
-function ago(iso) {
+function energy(kwh) {
+  if (!isNum(kwh)) return NA;
+  return kwh >= 1 ? kwh.toFixed(2) + ' kWh' : Math.round(kwh * 1000) + ' Wh';
+}
+// After timeAgo() in nrp-site's llm-status.astro.
+function timeAgo(iso) {
   if (!iso) return NA;
-  const s = (Date.now() - new Date(iso).getTime()) / 1000;
-  if (s < 90) return 'just now';
-  if (s < 3600) return Math.round(s / 60) + ' min ago';
-  if (s < 86400 * 2) return Math.round(s / 3600) + ' h ago';
-  return Math.round(s / 86400) + ' d ago';
+  const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return mins + 'm ago';
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return hrs + 'h ago';
+  return Math.floor(hrs / 24) + 'd ago';
 }
 function when(iso) {
   return iso ? new Date(iso).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'}) : NA;
 }
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-const winLabel = w => ({'24h': '24 h', '7d': '7 d', '15d': '15 d'}[w] || w);
+const winLabel = w => ({'3h': '3 h', '24h': '24 h', '7d': '7 d', '15d': '15 d'}[w] || w);
+const STATUS_LABEL = {generating: 'Generating', idle: 'Idle', offline: 'Offline'};
+const isOnline = m => m.status === 'generating' || m.status === 'idle';
+const nameOf = m => m.display_name || m.model_name;
+
+// Hardware, not hosts: which GB10 served a model is of no interest; how many
+// GPUs of what kind, and whether they were split tensor-parallel, is.
+function hardware(m) {
+  const n = m.gpu_count || 1;
+  const tp = (m.power_hosts || []).length > 1 ? ' · tensor-parallel' : '';
+  return `${n}× ${m.gpu_hardware || 'GPU'}${tp}`;
+}
 
 // Commercial frontier estimate (see /methodology): hosting floor + marginal
 // per-token energy for a ~1.5T-param MoE on 24x H100.
@@ -254,22 +388,22 @@ const REF = {carGPerMile: 404, phoneChargeG: 8.22, fridgeW: 150, treeKgPerMonth:
 
 // ---- data --------------------------------------------------------------------
 async function load() {
-  const st = document.getElementById('status');
   try {
-    const res = await fetch(API);
+    const res = await fetch(API, {signal: AbortSignal.timeout(15000)});
     if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
     data = await res.json();
+    document.getElementById('error').classList.remove('show');
     render();
-    st.textContent = 'Updated ' + new Date(data.updated_at).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
   } catch (e) {
-    st.textContent = 'Could not load: ' + e.message;
+    setHealth('bad', 'API unreachable');
+    const el = document.getElementById('error');
+    el.textContent = `Could not load model status (${e.name === 'TimeoutError' ? 'timed out' : e.message}). Retrying every 30 s.`;
+    el.classList.add('show');
   }
 }
 
-// Which record a card shows: live state in Live mode when the model is up;
-// otherwise the aggregate for the selected window, falling back to the
-// longest window that has data (a model offline for a week still shows
-// its record).
+// The window record a card shows: the selected window, else the longest
+// window that has data (a model offline for a week still shows its record).
 function pickAggregate(m) {
   if (m.aggregates[win]) return {agg: m.aggregates[win], window: win, fallback: false};
   const order = (data.windows || []).map(w => w.name);
@@ -281,28 +415,43 @@ function pickAggregate(m) {
 
 function render() {
   if (!data) return;
+  renderHealth();
   renderControls();
   renderSummary();
-  renderCards();
+  renderModels();
+  if (openId) renderSheetHead();
+}
+
+// After updateHealthBadge() in nrp-site's llm-status.astro.
+function setHealth(kind, text) {
+  document.getElementById('health').className = 'health ' + kind;
+  document.getElementById('health-text').textContent = text;
+}
+function renderHealth() {
+  const ms = data.models || [];
+  const online = ms.filter(isOnline).length;
+  const down = ms.filter(m => !isOnline(m) && m.last_seen && Date.now() - new Date(m.last_seen) < DOWN_WITHIN_MS).length;
+  if (down > 0) setHealth('warn', `${online} online, ${down} down`);
+  else if (online === 0) setHealth('warn', 'No models online');
+  else setHealth('ok', `${online} model${online === 1 ? '' : 's'} online`);
+  document.getElementById('health').title = `Updated ${new Date(data.updated_at).toLocaleTimeString()}` +
+    (down ? ` · "down" = stopped within the last ${DOWN_WITHIN_MS / 60000} min` : '');
 }
 
 function renderControls() {
   const names = (data.windows || []).map(w => w.name);
-  if (names.length && !names.includes(win)) { win = names.includes('7d') ? '7d' : names[0]; saveView(); }
-  if (mode !== 'live' && mode !== 'aggregate') mode = 'live';
-  document.querySelectorAll('#mode-seg button').forEach(b => b.setAttribute('aria-pressed', b.dataset.mode === mode));
+  if (names.length && !names.includes(win)) { win = names.includes('7d') ? '7d' : names[0]; writeHash(); }
   const seg = document.getElementById('win-seg');
   if (!seg.children.length) {
-    seg.innerHTML = (data.windows || []).map(w => `<button type="button" data-win="${esc(w.name)}">${winLabel(w.name)}</button>`).join('');
+    seg.innerHTML = names.map(w => `<button type="button" data-win="${esc(w)}">${winLabel(w)}</button>`).join('');
     seg.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
-      win = b.dataset.win; saveView(); render(); loadTimeSeries();
+      win = b.dataset.win; store('carbon.window', win); writeHash(); render(); loadCumulative();
     }));
   }
   seg.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', b.dataset.win === win));
   const retention = data.retention_start ? ` Prometheus holds data since ${when(data.retention_start)}.` : '';
-  document.getElementById('controls-note').textContent = mode === 'live'
-    ? `Running models show live numbers; models that are not running show their ${winLabel(win)} record.${retention}`
-    : `Every model shows its record over the last ${winLabel(win)}. Energy counts idle serving time too.${retention}`;
+  document.getElementById('controls-note').textContent =
+    `Cards show live numbers and energy over the last ${winLabel(win)}; idle serving time counts. Click a card for charts.${retention}`;
 }
 
 function tile(label, value, unit) {
@@ -312,194 +461,377 @@ function tile(label, value, unit) {
 function renderSummary() {
   const ms = data.models || [];
   const up = ms.filter(m => m.live);
-  const gen = ms.filter(m => m.status === 'generating');
-  let html;
-  if (mode === 'live') {
-    const w = up.reduce((s, m) => s + m.live.power_watts, 0);
-    const co2h = up.reduce((s, m) => s + m.live.co2_grams_per_hour, 0);
-    const tok = up.reduce((s, m) => s + m.live.prompt_tokens_per_sec + m.live.generation_tokens_per_sec, 0);
-    const running = up.reduce((s, m) => s + m.live.requests_running, 0);
-    html = tile('LLM GPU power now', num(w, 1), 'watts, serving models only')
-      + tile('CO₂ per hour', num(co2h, 2), 'grams at current draw')
-      + tile('Models serving', `${up.length}`, `${gen.length} generating · ${ms.length - up.length} offline`)
-      + tile('Requests in flight', compact(running), 'across all models')
-      + tile('Tokens per second', num(tok, 1), 'prompt + generated, all models');
-  } else {
-    const aggs = ms.map(m => m.aggregates[win]).filter(Boolean);
-    const kwh = aggs.reduce((s, a) => s + a.energy_kwh, 0);
-    const g = aggs.reduce((s, a) => s + a.co2_grams, 0);
-    const tokens = aggs.reduce((s, a) => s + a.prompt_tokens + a.generation_tokens, 0);
-    const reqs = aggs.reduce((s, a) => s + a.requests, 0);
-    const mgPerTok = tokens > 0 ? g * 1000 / tokens : null;
-    html = tile('Energy', num(kwh, 2), `kWh over ${winLabel(win)}`)
-      + tile('CO₂ emitted', grams(g), `over ${winLabel(win)}`)
-      + tile('Tokens processed', compact(tokens), `${compact(reqs)} requests`)
-      + tile('CO₂ per 1K tokens', isNum(mgPerTok) ? num(mgPerTok, 2) : NA, 'mg, all serving energy')
-      + tile('Models with data', `${aggs.length}`, `in the last ${winLabel(win)}`);
-  }
-  document.getElementById('summary').innerHTML = html;
+  const w = up.reduce((s, m) => s + m.live.power_watts, 0);
+  const co2h = up.reduce((s, m) => s + m.live.co2_grams_per_hour, 0);
+  const tok = up.reduce((s, m) => s + m.live.prompt_tokens_per_sec + m.live.generation_tokens_per_sec, 0);
+  const aggs = ms.map(m => m.aggregates[win]).filter(Boolean);
+  const kwh = aggs.reduce((s, a) => s + a.energy_kwh, 0);
+  const g = aggs.reduce((s, a) => s + a.co2_grams, 0);
+  const tokens = aggs.reduce((s, a) => s + a.prompt_tokens + a.generation_tokens, 0);
+  const mgPerK = tokens > 0 ? g * 1e6 / tokens : null;
+  document.getElementById('summary').innerHTML =
+      tile('GPU power now', num(w, 1) + ' W', 'serving models only')
+    + tile('CO₂ now', num(co2h, 1) + ' g/h', 'at current draw')
+    + tile('Tokens now', num(tok, 1) + ' /s', 'prompt + generated')
+    + tile(`Energy, ${winLabel(win)}`, energy(kwh), `${aggs.length} model${aggs.length === 1 ? '' : 's'} served`)
+    + tile(`CO₂, ${winLabel(win)}`, grams(g), `${compact(tokens)} tokens`)
+    + tile('CO₂ per 1K tokens', isNum(mgPerK) ? num(mgPerK, 2) + ' mg' : NA, `all serving energy, ${winLabel(win)}`);
 }
 
-const perfRow = (label, value, title = '') =>
-  `<div${title ? ` title="${esc(title)}"` : ''}><dt>${label}</dt><dd class="${value === NA ? 'na' : ''}">${value}</dd></div>`;
-
-// One card can span several nodes (the same model served on each in turn).
-// power_hosts / gpu_* describe the one serving now (else the latest); nodes
-// lists every node the card's record comes from.
-function hardware(m) {
-  const hosts = m.power_hosts || [m.node];
-  const tp = hosts.length > 1 ? ` · tensor-parallel ×${hosts.length}` : '';
-  const others = (m.nodes || []).filter(n => !hosts.includes(n));
-  const also = others.length ? ` · also served on ${esc(others.join(', '))}` : '';
-  return `${esc(hosts.join(' + '))} · ${m.gpu_count}× ${esc(m.gpu_hardware || 'GPU')}${tp}${also}`;
+// ---- cards -----------------------------------------------------------------
+// After buildStatWidgets() in nrp-site's llm-status.astro.
+function stat(label, value, opts = {}) {
+  const na = value === NA;
+  return `<div class="stat${opts.carbon ? ' carbon' : ''}"${opts.title ? ` title="${esc(opts.title)}"` : ''}>
+    <div class="stat-label">${label}</div>
+    <div class="stat-value${na ? ' na' : ''}">${value}</div></div>`;
 }
-const servedAs = m => (m.model_names && m.model_names.length ? m.model_names : [m.model_name])
-  .map(n => `<code>${esc(n)}</code>`).join(', ');
+const unit = (v, u) => v === NA ? NA : `${v} <small>${u}</small>`;
 
-function liveBody(m) {
-  const l = m.live;
-  const carbon = `
-    <div class="carbon">
-      <div class="m"><div class="m-label">GPU power</div><div class="m-value">${num(l.power_watts, 1)}</div><div class="m-unit">watts, 5 min</div></div>
-      <div class="m"><div class="m-label">CO₂ / hour</div><div class="m-value">${num(l.co2_grams_per_hour, 2)}</div><div class="m-unit">grams</div></div>
-      <div class="m"><div class="m-label">CO₂ / token</div><div class="m-value">${isNum(l.co2_mg_per_token) ? num(l.co2_mg_per_token, 4) : NA}</div><div class="m-unit">${isNum(l.co2_mg_per_token) ? 'mg' : 'mg · idle'}</div></div>
-    </div>`;
-  const perf = `
-    <dl class="perf">
-      ${perfRow('Decode speed', isNum(l.decode_tokens_per_sec) ? num(l.decode_tokens_per_sec, 1) + ' tok/s' : NA, 'Output tokens per second while generating (2 min)')}
-      ${perfRow('Prompt tokens', num(l.prompt_tokens_per_sec, 1) + ' /s', 'Input tokens processed per second (2 min)')}
-      ${perfRow('Running / queued', `${compact(l.requests_running)} / ${compact(l.requests_waiting)}`)}
-      ${perfRow('Requests', num(l.requests_per_hour, 1) + ' /h', 'Completed requests per hour (15 min)')}
-      ${perfRow('TTFT p50', secs(l.ttft_p50_seconds), 'Time to first token, median (15 min)')}
-      ${perfRow('Queue p50', secs(l.queue_p50_seconds), 'Time waiting before scheduling, median (15 min)')}
-      ${perfRow('E2E p50', secs(l.e2e_p50_seconds), 'End-to-end request latency, median (15 min)')}
-      ${perfRow('E2E p95', secs(l.e2e_p95_seconds), 'End-to-end request latency, 95th percentile (15 min)')}
-      ${perfRow('KV cache', pct(l.kv_cache_usage_percent))}
-      ${perfRow('GPU util', pct(l.gpu_util_percent), 'Mean over every GPU the model spans (5 min)')}
-      ${perfRow('Prefix-cache hits', pct(l.prefix_cache_hit_percent), 'Share of prompt tokens served from cache (15 min)')}
-      ${perfRow('Spec-decode accept', pct(l.spec_decode_accept_percent), 'Draft tokens accepted by speculative decoding (15 min)')}
-    </dl>`;
-  return carbon + perf;
+function liveStats(l) {
+  return stat('Power', unit(num(l.power_watts, 1), 'W'), {carbon: true, title: 'GPU power, 5-minute mean, every GPU the model spans'})
+    + stat('CO₂', unit(num(l.co2_grams_per_hour, 1), 'g/h'), {carbon: true, title: 'At current draw and the CAMX grid intensity'})
+    + stat('Tokens', unit(num(l.generation_tokens_per_sec, 1), 'tok/s'), {title: `Generated tokens per second (2 min); prompt ${num(l.prompt_tokens_per_sec, 1)} tok/s`})
+    + stat('Run / wait', `${compact(l.requests_running)} / ${compact(l.requests_waiting)}`, {title: 'Requests running / waiting now'})
+    + stat('KV cache', pct(l.kv_cache_usage_percent))
+    + stat('CO₂ / token', isNum(l.co2_mg_per_token) ? unit(num(l.co2_mg_per_token, 3), 'mg') : NA, {carbon: true, title: 'Shown only above 5 tok/s'});
+}
+function windowStats(a) {
+  if (!a) return '';
+  return stat('Energy', energy(a.energy_kwh), {carbon: true, title: `${num(a.serving_hours, 1)} h serving`})
+    + stat('CO₂', grams(a.co2_grams), {carbon: true})
+    + stat('Energy / token', isNum(a.joules_per_token) ? unit(num(a.joules_per_token, 2), 'J') : NA, {carbon: true, title: 'All serving energy over prompt + generated tokens'});
 }
 
-function aggBody(a) {
-  if (!a) return '<p class="empty">No data for this model in Prometheus’s retention.</p>';
-  const fw = isNum(a.prompt_tokens_per_sec_active) && a.active_power_watts > 0
-    ? frontierWatts(a.prompt_tokens_per_sec_active, a.generation_tokens_per_sec_active || 0) / a.active_power_watts : null;
-  const carbon = `
-    <div class="carbon">
-      <div class="m"><div class="m-label">GPU power</div><div class="m-value">${num(a.power_watts, 1)}</div><div class="m-unit">W mean${a.active_hours > 0 ? ` · ${num(a.active_power_watts, 0)} W working` : ''}</div></div>
-      <div class="m"><div class="m-label">CO₂ / hour</div><div class="m-value">${num(a.co2_grams_per_hour, 2)}</div><div class="m-unit">grams, while serving</div></div>
-      <div class="m" title="All serving energy (idle hosting included) divided by every token. The figure after it counts only energy spent while generating."><div class="m-label">CO₂ / token</div><div class="m-value">${isNum(a.co2_mg_per_token) ? num(a.co2_mg_per_token, 4) : NA}</div><div class="m-unit">${isNum(a.co2_mg_per_token_active) ? `mg · ${num(a.co2_mg_per_token_active, 4)} working` : 'mg'}</div></div>
+const STATE_LABEL = ['not serving', 'serving, idle', 'generating'];
+function strip(m, w) {
+  const a = m.availability && m.availability[w];
+  if (!a) return `<div><div class="strip"><span></span></div><div class="strip-axis"><span>no availability data</span></div></div>`;
+  const f = t => new Date(t).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+  const c = [0, 0, 0];
+  const cells = a.states.map((s, i) => {
+    c[s]++;
+    const t0 = (a.start + i * a.step_seconds) * 1000;
+    return `<span data-s="${s}" title="${f(t0)} – ${f(t0 + a.step_seconds * 1000)}: ${STATE_LABEL[s]}"></span>`;
+  }).join('');
+  const label = `Of ${a.states.length} intervals: ${c[2]} generating, ${c[1]} serving idle, ${c[0]} not serving`;
+  return `<div><div class="strip" role="img" aria-label="${esc(label)}">${cells}</div>
+    <div class="strip-axis"><span>${winLabel(w)} ago</span><span>now</span></div></div>`;
+}
+const LEGEND = `<div class="legend"><span><i style="background:var(--strip-2)"></i>generating</span><span><i style="background:var(--strip-1)"></i>serving, idle</span><span><i style="background:var(--strip-0)"></i>not serving</span></div>`;
+
+function statusTag(m) {
+  return `<span class="status ${esc(m.status)}"><span class="sdot ${esc(m.status)}" aria-hidden="true"></span>${STATUS_LABEL[m.status] || esc(m.status)}</span>`;
+}
+
+function card(m) {
+  const pick = pickAggregate(m);
+  const winHead = pick.agg
+    ? `<div class="stats-head"><span>${pick.fallback ? `Last ${winLabel(pick.window)} (none in ${winLabel(win)})` : `Last ${winLabel(pick.window)}`}</span>${isNum(pick.agg.uptime_percent) ? `<span>${pct(pick.agg.uptime_percent)} uptime</span>` : ''}</div>`
+    : '';
+  return `
+  <article class="card ${esc(m.status)}" tabindex="0" role="button" data-id="${esc(m.id)}" aria-label="${esc(nameOf(m))}: ${STATUS_LABEL[m.status] || ''}. Open charts">
+    <div class="card-top">
+      <div style="min-width:0">
+        <h3 class="card-title">${esc(nameOf(m))}</h3>
+        <p class="card-hw">${esc(hardware(m))}</p>
+      </div>
+      ${statusTag(m)}
     </div>
-    <p class="carbon-extra">${num(a.energy_kwh, 3)} kWh · ${grams(a.co2_grams)} CO₂ · ${isNum(a.joules_per_token) ? num(a.joules_per_token, 3) + ' J/token' : 'no tokens'}${isNum(fw) ? ` · ~${compact(fw)}× less energy than a frontier-scale deployment (estimate)` : ''}</p>`;
-  const perf = `
-    <dl class="perf">
-      ${perfRow('Decode speed', isNum(a.decode_tokens_per_sec) ? num(a.decode_tokens_per_sec, 1) + ' tok/s' : NA, 'Output tokens per second while generating')}
-      ${perfRow('Uptime', pct(a.uptime_percent), `${num(a.serving_hours, 1)} h serving of ${num(a.covered_hours, 0)} h in the window`)}
-      ${perfRow('Tokens in / out', `${compact(a.prompt_tokens)} / ${compact(a.generation_tokens)}`)}
-      ${perfRow('Requests', compact(a.requests), isNum(a.mean_prompt_tokens) ? `Mean ${compact(a.mean_prompt_tokens)} prompt and ${compact(a.mean_generation_tokens)} generated tokens per request` : '')}
-      ${perfRow('Tokens / request', isNum(a.mean_prompt_tokens) ? `${compact(a.mean_prompt_tokens)} → ${compact(a.mean_generation_tokens)}` : NA, 'Mean prompt tokens → mean generated tokens')}
-      ${perfRow('Peak concurrent', compact(a.peak_requests_running), 'Most requests running at once (1 min resolution)')}
-      ${perfRow('TTFT p50 / p95', isNum(a.ttft_p50_seconds) ? `${secs(a.ttft_p50_seconds)} / ${secs(a.ttft_p95_seconds)}` : NA, 'Time to first token')}
-      ${perfRow('E2E p50 / p95', isNum(a.e2e_p50_seconds) ? `${secs(a.e2e_p50_seconds)} / ${secs(a.e2e_p95_seconds)}` : NA, 'End-to-end request latency')}
-      ${perfRow('Queue p50', secs(a.queue_p50_seconds), 'Time waiting before scheduling, median')}
-      ${perfRow('Working time', num(a.active_hours, 1) + ' h', 'Hours above 5 tok/s')}
-      ${perfRow('Prefix-cache hits', pct(a.prefix_cache_hit_percent), 'Share of prompt tokens served from cache')}
-      ${perfRow('Spec-decode accept', pct(a.spec_decode_accept_percent), 'Draft tokens accepted by speculative decoding')}
-    </dl>`;
-  return carbon + perf;
+    ${m.live ? `<div class="stats">${liveStats(m.live)}</div>` : ''}
+    ${winHead}
+    ${pick.agg ? `<div class="stats">${windowStats(pick.agg)}</div>` : '<p class="empty">No data in Prometheus’s retention.</p>'}
+    ${strip(m, win)}
+    <div class="card-foot"><span>${isOnline(m) ? 'Serving now' : 'Last seen ' + timeAgo(m.last_seen)}</span><span>${m.live && isNum(m.live.decode_tokens_per_sec) ? num(m.live.decode_tokens_per_sec, 1) + ' tok/s decode' : ''}</span></div>
+  </article>`;
 }
 
-// The oldest instant any query can see: the later of Prometheus retention
-// and the start of the widest window. A first_seen at that edge means the
-// model is at least that old, not that it appeared then.
+// After renderSection() in nrp-site's llm-status.astro: online first, the
+// offline section (mostly old benchmark variants) collapsed with a count.
+function renderModels() {
+  const ms = data.models || [];
+  const el = document.getElementById('models');
+  if (!ms.length) { el.innerHTML = '<p class="empty">No models found in Prometheus.</p>'; return; }
+  const online = ms.filter(isOnline), offline = ms.filter(m => !isOnline(m));
+  el.innerHTML = `
+    <section class="section">
+      <div class="section-head"><span class="sdot generating"></span><h2>Online</h2><span class="count">(${online.length})</span></div>
+      ${online.length ? `<div class="grid">${online.map(card).join('')}</div>` : '<p class="empty">No model is serving right now.</p>'}
+    </section>
+    ${offline.length ? `
+    <section class="section">
+      <button type="button" class="section-head" id="offline-toggle" aria-expanded="${offlineOpen}" aria-controls="offline-grid">
+        <span class="sdot offline"></span><h2>Offline</h2><span class="count">(${offline.length})</span><span class="chev" aria-hidden="true">▼</span>
+      </button>
+      <p class="section-note">Served within Prometheus's 15-day retention, not serving now; most recently seen first.</p>
+      <div class="grid" id="offline-grid"${offlineOpen ? '' : ' hidden'}>${offline.map(card).join('')}</div>
+    </section>` : ''}
+    ${LEGEND}`;
+  const t = document.getElementById('offline-toggle');
+  if (t) t.addEventListener('click', () => {
+    offlineOpen = !offlineOpen;
+    t.setAttribute('aria-expanded', offlineOpen);
+    document.getElementById('offline-grid').hidden = !offlineOpen;
+  });
+}
+
+const modelsEl = document.getElementById('models');
+modelsEl.addEventListener('click', e => {
+  const c = e.target.closest('.card');
+  if (c) openModel(c.dataset.id, c);
+});
+modelsEl.addEventListener('keydown', e => {
+  const c = e.target.closest('.card');
+  if (c && e.target === c && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); openModel(c.dataset.id, c); }
+});
+
+// ---- drill-down ----------------------------------------------------------------
+// After showDetailOverlay() in nrp-site's llm-status.astro.
+const overlay = document.getElementById('overlay');
+
+function openModel(id, from) {
+  openId = id;
+  lastFocus = from || document.activeElement;
+  writeHash();
+  if (!renderSheetHead()) return;
+  const wasOpen = !overlay.hidden;
+  overlay.hidden = false;
+  document.body.classList.add('modal-open');
+  if (!wasOpen) overlay.scrollTop = 0;
+  buildCharts();
+  document.getElementById('back').focus();
+  loadSeries();
+  clearInterval(sheetTimer);
+  sheetTimer = setInterval(loadSeries, 60000);
+}
+function closeModel() {
+  if (overlay.hidden) return;
+  overlay.hidden = true;
+  document.body.classList.remove('modal-open');
+  clearInterval(sheetTimer);
+  seriesSeq++;
+  Object.values(charts).forEach(c => c.chart && c.chart.destroy());
+  charts = {};
+  openId = null;
+  writeHash();
+  const back = lastFocus && document.contains(lastFocus) ? lastFocus : document.querySelector('.card');
+  if (back) back.focus();
+}
+document.getElementById('back').addEventListener('click', closeModel);
+overlay.addEventListener('click', e => { if (e.target === overlay) closeModel(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModel(); });
+addEventListener('hashchange', () => {
+  const id = new URLSearchParams(location.hash.slice(1)).get('model');
+  if (id && id !== openId) openModel(id);
+  else if (!id) closeModel();
+});
+
+// The sheet's header, re-rendered on every overview refresh. Returns false
+// (and drops the deep link) for an id the API does not know.
+function renderSheetHead() {
+  if (!data) return false;
+  const m = (data.models || []).find(x => x.id === openId);
+  if (!m) { closeModel(); openId = null; writeHash(); return false; }
+  const pick = pickAggregate(m);
+  const a = pick.agg, l = m.live;
+  const fw = a && isNum(a.prompt_tokens_per_sec_active) && a.active_power_watts > 0
+    ? frontierWatts(a.prompt_tokens_per_sec_active, a.generation_tokens_per_sec_active || 0) / a.active_power_watts : null;
+  const served = (m.model_names && m.model_names.length ? m.model_names : [m.model_name]).map(n => `<code>${esc(n)}</code>`).join(', ');
+  document.getElementById('sheet-status').innerHTML = statusTag(m);
+  document.getElementById('sheet-head').innerHTML = `
+    <h2 id="sheet-title">${esc(nameOf(m))}</h2>
+    ${m.description ? `<p class="desc">${esc(m.description)}</p>` : ''}
+    <p class="meta">${esc(hardware(m))} · served as ${served} · first seen ${firstSeen(m)} · ${isOnline(m) ? 'serving now' : 'last seen ' + when(m.last_seen) + ' (' + timeAgo(m.last_seen) + ')'}</p>
+    ${l ? `<div class="stats-head"><span>Now</span><span>updated ${new Date(data.updated_at).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}</span></div>
+    <div class="stats">${liveStats(l)}
+      ${stat('Prompt', unit(num(l.prompt_tokens_per_sec, 1), 'tok/s'))}
+      ${stat('Decode speed', isNum(l.decode_tokens_per_sec) ? unit(num(l.decode_tokens_per_sec, 1), 'tok/s') : NA, {title: 'Generation speed while generating (2 min)'})}
+      ${stat('GPU util', pct(l.gpu_util_percent), {title: 'Mean over every GPU the model spans (5 min)'})}
+      ${stat('Requests', unit(num(l.requests_per_hour, 1), '/h'), {title: 'Completed requests per hour (15 min)'})}
+      ${stat('TTFT p50', secs(l.ttft_p50_seconds), {title: 'Time to first token (15 min; withheld below 20 requests)'})}
+      ${stat('E2E p50 / p95', isNum(l.e2e_p50_seconds) ? `${secs(l.e2e_p50_seconds)} / ${secs(l.e2e_p95_seconds)}` : NA)}
+      ${stat('Prefix-cache hits', pct(l.prefix_cache_hit_percent))}
+      ${stat('Spec-decode accept', pct(l.spec_decode_accept_percent))}
+    </div>` : ''}
+    ${a ? `<div class="stats-head"><span>Last ${winLabel(pick.window)}${pick.fallback ? ` (no data in ${winLabel(win)})` : ''}</span><span>${pct(a.uptime_percent)} uptime · ${num(a.serving_hours, 1)} h serving</span></div>
+    <div class="stats">${windowStats(a)}
+      ${stat('Mean power', unit(num(a.power_watts, 1), 'W'), {carbon: true, title: a.active_hours > 0 ? `${num(a.active_power_watts, 0)} W while working` : ''})}
+      ${stat('CO₂ / token', isNum(a.co2_mg_per_token) ? unit(num(a.co2_mg_per_token, 3), 'mg') : NA, {carbon: true, title: isNum(a.co2_mg_per_token_active) ? `${num(a.co2_mg_per_token_active, 4)} mg counting only working time` : ''})}
+      ${stat('Tokens in / out', `${compact(a.prompt_tokens)} / ${compact(a.generation_tokens)}`)}
+      ${stat('Requests', compact(a.requests), {title: isNum(a.mean_prompt_tokens) ? `Mean ${compact(a.mean_prompt_tokens)} → ${compact(a.mean_generation_tokens)} tokens per request` : ''})}
+      ${stat('Decode speed', isNum(a.decode_tokens_per_sec) ? unit(num(a.decode_tokens_per_sec, 1), 'tok/s') : NA)}
+      ${stat('E2E p50 / p95', isNum(a.e2e_p50_seconds) ? `${secs(a.e2e_p50_seconds)} / ${secs(a.e2e_p95_seconds)}` : NA)}
+    </div>
+    ${isNum(fw) ? `<p class="frontier">~${compact(fw)}× less energy than a frontier-scale deployment would use for the same work (<a href="/methodology#where">estimate</a>).</p>` : ''}` : ''}
+    ${strip(m, win)}
+    <div style="margin-top:.4rem">${LEGEND}</div>`;
+  return true;
+}
 function dataStart() {
   const widest = Math.max(0, ...(data.windows || []).map(w => w.seconds));
   const byWindow = new Date(new Date(data.updated_at).getTime() - widest * 1000);
   const ret = data.retention_start ? new Date(data.retention_start) : byWindow;
   return ret > byWindow ? ret : byWindow;
 }
-
-const STATE_LABEL = ['not serving', 'serving, idle', 'generating'];
-function strip(m) {
-  const a = m.availability && m.availability[win];
-  const n = a ? a.states.length : 0;
-  const cells = a ? a.states.map((s, i) => {
-    const t0 = (a.start + i * a.step_seconds) * 1000, t1 = t0 + a.step_seconds * 1000;
-    return `<span data-s="${s}" data-t0="${t0}" data-t1="${t1}"></span>`;
-  }).join('') : Array.from({length: 1}, () => '<span data-s="0"></span>').join('');
-  return `
-    <div class="strip-wrap">
-      <div class="strip-head"><span>Availability, last ${winLabel(win)}</span><span>${a ? `${n} × ${Math.round(a.step_seconds / 60) >= 60 ? (a.step_seconds / 3600) + ' h' : (a.step_seconds / 60) + ' min'}` : 'no data'}</span></div>
-      <div class="strip" role="img" aria-label="${esc(stripSummary(a))}">${cells}</div>
-      <div class="legend"><span><i style="background:var(--strip-2)"></i>generating</span><span><i style="background:var(--strip-1)"></i>serving, idle</span><span><i style="background:var(--strip-0)"></i>not serving</span></div>
-    </div>`;
-}
-function stripSummary(a) {
-  if (!a) return 'No availability data';
-  const c = [0, 0, 0];
-  a.states.forEach(s => c[s]++);
-  return `Of ${a.states.length} intervals: ${c[2]} generating, ${c[1]} serving idle, ${c[0]} not serving`;
+// A first_seen at the edge of what Prometheus holds means "at least this old".
+function firstSeen(m) {
+  if (!m.first_seen) return NA;
+  return (new Date(m.first_seen) - dataStart()) < 2 * 3600e3 ? `before ${when(dataStart().toISOString())}` : when(m.first_seen);
 }
 
-function renderCards() {
-  const ms = data.models || [];
-  const el = document.getElementById('cards');
-  if (!ms.length) { el.innerHTML = '<p class="empty">No models found in Prometheus.</p>'; return; }
-  el.innerHTML = ms.map(m => {
-    const showLive = mode === 'live' && m.live;
-    const pick = pickAggregate(m);
-    let source;
-    if (showLive) source = `<p class="source">Live · updated ${esc(new Date(data.updated_at).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}))}</p>`;
-    else if (mode === 'live') source = `<p class="source fallback">Not running · showing its ${winLabel(pick.window)} record · last seen ${ago(m.last_seen)}</p>`;
-    else source = `<p class="source${pick.fallback ? ' fallback' : ''}">${pick.fallback ? `No data in the last ${winLabel(win)} · showing ${winLabel(pick.window)}` : `${winLabel(win)} aggregate`}</p>`;
-    const firstSeen = m.first_seen && (new Date(m.first_seen) - dataStart()) < 2 * 3600e3
-      ? `before ${when(dataStart().toISOString())}` : when(m.first_seen);
-    return `
-    <article class="card ${m.status}">
-      <div class="card-top">
-        <div style="min-width:0">
-          <h3 class="card-title">${esc(m.display_name || m.model_name)}</h3>
-          <p class="card-sub">served as ${servedAs(m)} · ${hardware(m)}</p>
-          ${m.description ? `<p class="card-desc">${esc(m.description)}</p>` : ''}
-        </div>
-        <span class="pill ${m.status}"><span class="dot" aria-hidden="true"></span>${{generating: 'Generating', idle: 'Idle', offline: 'Offline'}[m.status] || esc(m.status)}</span>
-      </div>
-      ${source}
-      ${showLive ? liveBody(m) : aggBody(pick.agg)}
-      ${strip(m)}
-      <div class="card-foot"><span>First seen ${firstSeen}</span><span>Last seen ${m.status === 'offline' ? when(m.last_seen) : 'now'}</span></div>
-    </article>`;
-  }).join('');
+// One entry per chart; its lines come from the endpoint's metrics[key].
+const CHARTS = [
+  {key: 'power_watts', title: 'GPU power', unit: 'W', d: 1},
+  {key: 'co2_grams_per_hour', title: 'CO₂', unit: 'g/h', d: 2},
+  {key: 'tokens_per_sec', title: 'Throughput', unit: 'tok/s', d: 1},
+  {key: 'joules_per_token', title: 'Energy per token', unit: 'J', d: 2, note: 'above 5 tok/s'},
+  {key: 'requests', title: 'Requests', unit: '', d: 1, note: 'mean concurrency'},
+  {key: 'kv_cache_percent', title: 'KV cache', unit: '%', d: 1, max: 100},
+  {key: 'spec_decode_accept_percent', title: 'Spec-decode acceptance', unit: '%', d: 1, max: 100},
+  {key: 'prefix_cache_hit_percent', title: 'Prefix-cache hits', unit: '%', d: 1, max: 100},
+  {key: 'latency_seconds', title: 'Latency', unit: 's', d: 2, wide: true, note: 'from the step window’s requests'},
+];
+const COLORS = ['--c1', '--c2', '--c3', '--c4'];
+
+function buildCharts() {
+  const seg = document.getElementById('range-seg');
+  seg.innerHTML = RANGES.map(r => `<button type="button" data-range="${r}" aria-pressed="${r === range}">${r}</button>`).join('');
+  seg.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+    range = b.dataset.range;
+    seg.querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', x.dataset.range === range));
+    loadSeries();
+  }));
+  Object.values(charts).forEach(c => c.chart && c.chart.destroy());
+  document.getElementById('charts').innerHTML = CHARTS.map(c => `
+    <div class="chart${c.wide ? ' wide' : ''}">
+      <h3>${c.title}${c.unit ? ` <small>(${c.unit})</small>` : ''}${c.note ? ` <small>· ${c.note}</small>` : ''}</h3>
+      <div class="chart-box"><canvas data-key="${c.key}" aria-label="${esc(c.title)} over time"></canvas><div class="nodata">Loading…</div></div>
+    </div>`).join('');
+  document.getElementById('series-note').textContent = '';
+  charts = {};
+  CHARTS.forEach(c => { charts[c.key] = {cfg: c, chart: null, ds: null, range: null}; });
 }
 
-// ---- availability tooltip ---------------------------------------------------
-const tip = document.getElementById('tip');
-document.getElementById('cards').addEventListener('mousemove', e => {
-  const cell = e.target.closest('.strip span[data-t0]');
-  if (!cell) { tip.style.display = 'none'; return; }
-  const f = t => new Date(+t).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
-  tip.innerHTML = `<strong>${STATE_LABEL[+cell.dataset.s]}</strong><br>${f(cell.dataset.t0)} – ${f(cell.dataset.t1)}`;
-  tip.style.display = 'block';
-  const x = Math.min(e.clientX + 12, innerWidth - tip.offsetWidth - 8);
-  tip.style.left = x + 'px';
-  tip.style.top = (e.clientY + 14) + 'px';
-});
-document.getElementById('cards').addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+// Missing steps (the model was not serving) become gaps, not straight lines.
+function withGaps(points, step) {
+  const out = [];
+  for (let i = 0; i < points.length; i++) {
+    if (i > 0 && points[i][0] - points[i - 1][0] > step * 1.5) out.push({x: (points[i - 1][0] + step) * 1000, y: null});
+    out.push({x: points[i][0] * 1000, y: points[i][1]});
+  }
+  return out;
+}
+function stepLabel(s) { return s >= 3600 ? s / 3600 + ' h' : s >= 60 ? s / 60 + ' min' : s + ' s'; }
+
+async function loadSeries() {
+  if (!openId) return;
+  const seq = ++seriesSeq, id = openId, r = range;
+  let body;
+  try {
+    const res = await fetch(`/api/v1/models/${encodeURIComponent(id)}/timeseries?range=${r}`, {signal: AbortSignal.timeout(30000)});
+    if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+    body = await res.json();
+  } catch (e) {
+    if (seq !== seriesSeq) return;
+    Object.values(charts).forEach(c => showNoData(c, 'Could not load: ' + e.message));
+    return;
+  }
+  if (seq !== seriesSeq || id !== openId) return; // superseded, or the sheet closed
+  const failed = Object.keys(body.errors || {});
+  document.getElementById('series-note').textContent =
+    `Last ${winLabel(r)} in ${stepLabel(body.step_seconds)} steps, rates over ${body.window}; gaps are time the model was not serving. ` +
+    'Power counts every GPU the model spans, only while it serves.' +
+    (failed.length ? ` Some queries failed: ${failed.join(', ')}.` : '');
+  for (const c of Object.values(charts)) {
+    const lines = (body.metrics || {})[c.cfg.key] || [];
+    const ds = lines.map((s, i) => ({label: s.label, data: withGaps(s.points || [], body.step_seconds), colorVar: COLORS[i % COLORS.length]}));
+    if (!ds.some(d => d.data.length)) { showNoData(c, 'No data'); continue; }
+    // The whole range on the axis, so a model up for an hour reads as an hour.
+    drawChart(c, ds, r, [body.start * 1000, body.end * 1000]);
+  }
+}
+
+function showNoData(c, text) {
+  if (c.chart) { c.chart.destroy(); c.chart = null; }
+  c.ds = null;
+  const nd = document.querySelector(`canvas[data-key="${c.cfg.key}"] + .nodata`);
+  if (nd) { nd.textContent = text; nd.hidden = false; }
+}
+
+function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+function alpha(color, a) {
+  const m = /^#([0-9a-f]{6})$/i.exec(color);
+  if (!m) return color;
+  const n = parseInt(m[1], 16);
+  return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`;
+}
+function timeUnit(r) { return r === '3h' ? 'minute' : r === '24h' ? 'hour' : 'day'; }
+
+// After makeChartOptions() in nrp-site's llm-status.astro, with colours from
+// this page's theme tokens so the charts follow light and dark.
+function chartOptions(cfg, r, multi, span) {
+  const fmt = v => v == null ? '' : cfg.unit === 's' ? secs(v) : num(v, cfg.d) + (cfg.unit === '%' ? '%' : cfg.unit ? ' ' + cfg.unit : '');
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    interaction: {mode: 'index', intersect: false},
+    plugins: {
+      legend: {display: multi, position: 'top', align: 'end', labels: {color: css('--ink-2'), usePointStyle: true, pointStyle: 'circle', boxWidth: 6, boxHeight: 6, padding: 10, font: {size: 11}}},
+      tooltip: {
+        backgroundColor: css('--surface'), titleColor: css('--ink'), bodyColor: css('--ink-2'),
+        borderColor: css('--border-2'), borderWidth: 1, padding: 8,
+        callbacks: {label: ctx => ctx.parsed.y == null ? null : `${ctx.dataset.label}: ${fmt(ctx.parsed.y)}`},
+      },
+    },
+    scales: {
+      x: {
+        type: 'time', min: span && span[0], max: span && span[1],
+        time: {unit: timeUnit(r), displayFormats: {minute: 'HH:mm', hour: 'MMM d HH:mm', day: 'MMM d'}, tooltipFormat: 'MMM d, HH:mm'},
+        grid: {color: css('--grid')}, border: {color: css('--axis')},
+        ticks: {color: css('--muted'), maxRotation: 0, autoSkipPadding: 20, font: {size: 10}},
+      },
+      y: {
+        beginAtZero: true, suggestedMax: cfg.max,
+        grid: {color: css('--grid')}, border: {display: false},
+        ticks: {color: css('--muted'), font: {size: 10}, maxTicksLimit: 5,
+          callback: v => cfg.unit === '%' ? v + '%' : cfg.unit === 's' ? secs(v) : Math.abs(v) < 1000 ? +(+v).toFixed(2) : compact(v)},
+      },
+    },
+  };
+}
+
+function drawChart(c, ds, r, span) {
+  const canvas = document.querySelector(`canvas[data-key="${c.cfg.key}"]`);
+  if (!canvas) return;
+  canvas.nextElementSibling.hidden = true;
+  c.ds = ds; c.range = r; c.span = span;
+  const multi = ds.length > 1;
+  const datasets = ds.map(d => {
+    const col = css(d.colorVar);
+    return {label: d.label, data: d.data, borderColor: col, backgroundColor: alpha(col, .12),
+      borderWidth: 1.75, pointRadius: 0, pointHoverRadius: 3, tension: 0.2, fill: !multi, spanGaps: false};
+  });
+  if (c.chart) c.chart.destroy();
+  c.chart = new Chart(canvas, {type: 'line', data: {datasets}, options: chartOptions(c.cfg, r, multi, span)});
+}
+
+function restyleCharts() {
+  for (const c of Object.values(charts)) if (c.chart && c.ds) drawChart(c, c.ds, c.range, c.span);
+  if (cumChart) styleCumulative();
+}
 
 // ---- cumulative CO2 chart ----------------------------------------------------
-function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
-function styleChart() {
-  const o = lineChart.options;
+function styleCumulative() {
+  const o = cumChart.options;
   o.scales.x.ticks.color = o.scales.y.ticks.color = o.scales.y.title.color = css('--muted');
   o.scales.x.grid.color = o.scales.y.grid.color = css('--grid');
-  lineChart.data.datasets[0].borderColor = css('--accent');
-  lineChart.data.datasets[0].backgroundColor = css('--accent-wash');
-  lineChart.update('none');
+  cumChart.data.datasets[0].borderColor = css('--accent');
+  cumChart.data.datasets[0].backgroundColor = css('--accent-wash');
+  cumChart.update('none');
 }
 
-async function loadTimeSeries() {
+async function loadCumulative() {
   let ts;
   try {
     const res = await fetch(`${TS_API}?range=${win}`);
@@ -508,40 +840,32 @@ async function loadTimeSeries() {
   const pts = ts.points || [];
   const stepH = parseStep(ts.step) / 3600;
   let running = 0;
-  const cum = pts.map(p => (running += p.co2_grams_per_hour * stepH, +running.toFixed(2)));
-  document.getElementById('chart-title').textContent = `Cumulative LLM CO₂, last ${winLabel(win)}`;
-  document.getElementById('chart-total').textContent = pts.length ? `Total ${grams(running)} CO₂e` : 'No data';
+  const cum = pts.map(p => ({x: p.t * 1000, y: +(running += p.co2_grams_per_hour * stepH).toFixed(2)}));
+  document.getElementById('cum-title').textContent = `Cumulative LLM CO₂, last ${winLabel(win)}`;
+  document.getElementById('cum-total').textContent = pts.length ? `Total ${grams(running)} CO₂e, all models` : 'No data';
   renderReferenceFrames(running);
-
-  const labels = pts.map(p => {
-    const d = new Date(p.t * 1000);
-    return win === '24h' ? d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})
-      : d.toLocaleDateString([], {month: 'short', day: 'numeric'}) + (win === '7d' ? ' ' + d.toLocaleTimeString([], {hour: '2-digit'}) : '');
-  });
-  const ds = {label: 'Cumulative CO₂ (g)', data: cum, borderWidth: 2, fill: true, tension: 0.25, pointRadius: 0, pointHoverRadius: 4};
-  if (lineChart) {
-    lineChart.data.labels = labels;
-    lineChart.data.datasets[0].data = cum;
-    styleChart();
+  const tu = win === '24h' ? 'hour' : 'day';
+  if (cumChart) {
+    cumChart.data.datasets[0].data = cum;
+    cumChart.options.scales.x.time.unit = tu;
+    styleCumulative();
     return;
   }
-  lineChart = new Chart(document.getElementById('lineChart'), {
+  cumChart = new Chart(document.getElementById('cum-chart'), {
     type: 'line',
-    data: {labels, datasets: [ds]},
+    data: {datasets: [{label: 'Cumulative CO₂ (g)', data: cum, borderWidth: 2, fill: true, tension: 0.25, pointRadius: 0, pointHoverRadius: 4}]},
     options: {
-      responsive: true,
+      responsive: true, maintainAspectRatio: false, animation: false,
       interaction: {mode: 'index', intersect: false},
-      plugins: {
-        legend: {display: false},
-        tooltip: {callbacks: {label: c => ` ${grams(c.parsed.y)} CO₂ so far`}},
-      },
+      plugins: {legend: {display: false}, tooltip: {callbacks: {label: c => ` ${grams(c.parsed.y)} CO₂ so far`}}},
       scales: {
-        x: {ticks: {font: {size: 10}, maxTicksLimit: 8, maxRotation: 0}, grid: {display: false}},
+        x: {type: 'time', time: {unit: tu, displayFormats: {hour: 'HH:mm', day: 'MMM d'}, tooltipFormat: 'MMM d, HH:mm'},
+            ticks: {font: {size: 10}, maxRotation: 0, autoSkipPadding: 20}, grid: {display: false}},
         y: {beginAtZero: true, ticks: {font: {size: 10}}, grid: {}, title: {display: true, text: 'g CO₂, cumulative', font: {size: 10}}},
       },
     },
   });
-  styleChart();
+  styleCumulative();
 }
 function parseStep(s) {
   const h = /(\d+)h/.exec(s), m = /(\d+)m/.exec(s), x = /(\d+)s/.exec(s);
@@ -560,13 +884,13 @@ function renderReferenceFrames(g) {
 }
 
 // ---- wiring ------------------------------------------------------------------
-document.querySelectorAll('#mode-seg button').forEach(b => b.addEventListener('click', () => {
-  mode = b.dataset.mode; saveView(); render();
-}));
-
-load().then(loadTimeSeries);
+applyTheme(theme);
+load().then(() => {
+  loadCumulative();
+  if (openId && overlay.hidden) openModel(openId);
+});
 setInterval(load, 30000);
-setInterval(loadTimeSeries, 300000);
+setInterval(loadCumulative, 300000);
 </script>
 </body>
 </html>

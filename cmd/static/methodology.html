@@ -171,20 +171,36 @@ sum by (node, namespace, model_name) (
   power draw rather than the model's efficiency under real load.
 </p>
 
-<h3>Live and aggregate views</h3>
+<h3>What the dashboard shows</h3>
 <p>
-  A single toggle switches every card between two records:
+  Cards are grouped into <strong>Online</strong> (generating or idle) and
+  <strong>Offline</strong>, the latter collapsed by default. A card names the model and its
+  hardware (e.g. "2× NVIDIA GB10 · tensor-parallel"), not the node: the GB10s are
+  interchangeable. Each card carries two records:
 </p>
 <ul style="color:#cbd5e1; padding-left:1.5rem; margin:0.5rem 0 1rem;">
-  <li><strong>Live</strong> — the model's current state: 5-minute power, 2-minute token
-  rates, 15-minute request and latency figures, instant engine gauges. A model that is
-  not running shows its aggregate for the selected window instead, labelled as such
-  with when it was last seen.</li>
-  <li><strong>Aggregate</strong> — the model's record over the last 24 h, 7 d or 15 d,
-  recomputed from Prometheus every five minutes. 15 days is the cluster's Prometheus
-  retention, so it is the longest window offered; a model with no data in the chosen
-  window falls back to the longest window that has some.</li>
+  <li><strong>Now</strong> (online models only) — the model's current state: 5-minute power,
+  2-minute token rates, 15-minute request and latency figures, instant engine gauges.</li>
+  <li><strong>Window</strong> — energy, CO₂ and J/token over the last 24 h, 7 d or 15 d
+  (the window selector), recomputed from Prometheus every five minutes. 15 days is the
+  cluster's Prometheus retention, so it is the longest window offered; a model with no
+  data in the chosen window falls back to the longest window that has some.</li>
 </ul>
+<p>
+  Clicking a card opens its drill-down (deep-linkable as <code>#model=&lt;id&gt;</code>):
+  every live and window figure, plus charts over the last 3 h, 24 h, 7 d or 15 d of
+  power, CO₂/hour, throughput, J/token, running and waiting requests, KV cache,
+  spec-decode acceptance, prefix-cache hits and latency (end-to-end p50/p95/p99, TTFT
+  p50). The charts come from Prometheus range queries built from the same expressions as
+  the cards, so a chart's power is attributed exactly as the card's is. Their steps are
+  30 s, 2 min, 15 min and 1 h; each point's rates and averages cover a window at least
+  one step long. Chart percentiles are <em>not</em> withheld below 20 requests, so a
+  point backed by a handful of requests is noisy.
+</p>
+<p>
+  The header pill counts models online. It turns yellow when a model stopped within the
+  last 30 minutes ("down") or none is online, and red when the API cannot be reached.
+</p>
 <h3>How aggregates are computed</h3>
 <p>
   Every aggregate is a ratio of totals over the window — never an average of ratios — so
@@ -334,13 +350,13 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
 </div>
 
 <p>
-  Each card's aggregate view also shows tokens in and out and the mean tokens per
+  Each model's drill-down also shows tokens in and out and the mean tokens per
   request, for transparency about the workload driving the comparison.
 </p>
 
 <h3 id="where">Where the comparison appears</h3>
 <p>
-  In the aggregate view, a card whose model did any work in the window shows one line —
+  In a model's drill-down, a model that did any work in the window shows one line —
   "~N× less energy than a frontier-scale deployment (estimate)" — computed as
   <code>frontier_watts / measured_working_watts</code>, with the frontier side fed the
   model's own working-time prompt and generation rates. It is informational, not a
