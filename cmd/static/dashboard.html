@@ -343,11 +343,18 @@ function renderSummary() {
 const perfRow = (label, value, title = '') =>
   `<div${title ? ` title="${esc(title)}"` : ''}><dt>${label}</dt><dd class="${value === NA ? 'na' : ''}">${value}</dd></div>`;
 
+// One card can span several nodes (the same model served on each in turn).
+// power_hosts / gpu_* describe the one serving now (else the latest); nodes
+// lists every node the card's record comes from.
 function hardware(m) {
   const hosts = m.power_hosts || [m.node];
   const tp = hosts.length > 1 ? ` · tensor-parallel ×${hosts.length}` : '';
-  return `${esc(hosts.join(' + '))} · ${m.gpu_count}× ${esc(m.gpu_hardware || 'GPU')}${tp}`;
+  const others = (m.nodes || []).filter(n => !hosts.includes(n));
+  const also = others.length ? ` · also served on ${esc(others.join(', '))}` : '';
+  return `${esc(hosts.join(' + '))} · ${m.gpu_count}× ${esc(m.gpu_hardware || 'GPU')}${tp}${also}`;
 }
+const servedAs = m => (m.model_names && m.model_names.length ? m.model_names : [m.model_name])
+  .map(n => `<code>${esc(n)}</code>`).join(', ');
 
 function liveBody(m) {
   const l = m.live;
@@ -454,7 +461,7 @@ function renderCards() {
       <div class="card-top">
         <div style="min-width:0">
           <h3 class="card-title">${esc(m.display_name || m.model_name)}</h3>
-          <p class="card-sub">served as <code>${esc(m.model_name)}</code> · ${hardware(m)}</p>
+          <p class="card-sub">served as ${servedAs(m)} · ${hardware(m)}</p>
           ${m.description ? `<p class="card-desc">${esc(m.description)}</p>` : ''}
         </div>
         <span class="pill ${m.status}"><span class="dot" aria-hidden="true"></span>${{generating: 'Generating', idle: 'Idle', offline: 'Offline'}[m.status] || esc(m.status)}</span>
