@@ -494,8 +494,8 @@ function liveStats(l) {
     + stat('CO₂ / token', isNum(l.co2_mg_per_token) ? unit(num(l.co2_mg_per_token, 3), 'mg') : NA, {carbon: true, title: 'Shown only above 5 tok/s'})
     + perfStats(isNum(l.decode_tokens_per_sec) ? l.decode_tokens_per_sec : null, l.prompt_tokens_per_sec, l.spec_decode_accept_percent,
         {decode: 'Output tokens per second while generating (2 min)', prefill: 'Prompt tokens processed per second, cached tokens included (2 min)', spec: 'Draft tokens accepted by speculative decoding (15 min)'})
-    + stat('Run / wait', `${compact(l.requests_running)} / ${compact(l.requests_waiting)}`, {title: 'Requests running / waiting now'})
-    + stat('KV cache', pct(l.kv_cache_usage_percent))
+    + stat('Run / wait', `${compact(l.requests_running)} / ${compact(l.requests_waiting)}`, {title: 'Peak requests running / waiting over the last 2 minutes'})
+    + stat('KV cache', pct(l.kv_cache_usage_percent), {title: 'Peak KV cache usage over the last 2 minutes'})
     + stat('TTFT p50', secs(l.ttft_p50_seconds), {title: 'Time to first token, median (15 min)'});
 }
 function windowStats(a) {

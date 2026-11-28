@@ -400,10 +400,12 @@ Ratio: 5,426 / 11 = 493× — nimbus uses 493× less energy for the same tokens.
 <table>
   <tr><th>Metric</th><th>Source</th><th>Notes</th></tr>
   <tr><td>Running / Queued requests</td><td><code>vllm:num_requests_running</code> /
-    <code>vllm:num_requests_waiting</code></td><td>Live concurrency and backlog,
-    read as instant gauges — no averaging window</td></tr>
-  <tr><td>KV Cache</td><td><code>vllm:kv_cache_usage_perc</code></td><td>Instant
-    gauge, ×100 for display as a percentage</td></tr>
+    <code>vllm:num_requests_waiting</code></td><td>Live concurrency and backlog:
+    the peak over the last 2 minutes (<code>max_over_time</code>), the same window as
+    the token rates that mark a model as generating. An instant read shows 0 / 0
+    between a single-stream client's requests even while it is generating</td></tr>
+  <tr><td>KV Cache</td><td><code>vllm:kv_cache_usage_perc</code></td><td>Peak over
+    the last 2 minutes, ×100 for display as a percentage</td></tr>
   <tr><td>GPU Util</td><td><code>DCGM_FI_DEV_GPU_UTIL</code></td><td>Compute
     utilization %, averaged over 5 minutes (same smoothing window as the GPU
     Power tile) — a useful complement to Power: high power with low
