@@ -384,3 +384,39 @@ func TestHistQuantileMatchesPrometheus(t *testing.T) {
 		t.Error("no +Inf bucket should give no quantile")
 	}
 }
+
+// TestLiveGaugesUsePeakWindow: between a single-stream client's requests the
+// instant gauges read 0 while the 2-minute token rate still says generating;
+// run/wait/KV then show the 2-minute peak, so the card is not "generating 0/0".
+func TestLiveGaugesUsePeakWindow(t *testing.T) {
+	s, f := newTestScraper(time.Unix(1_790_000_000, 0))
+	q := s.liveQueries()
+	f.instant[q["running"]] = []prom.Result{res("inkling", "nimbus3", 0)}
+	f.instant[q["running_peak"]] = []prom.Result{res("inkling", "nimbus3", 1)}
+	f.instant[q["waiting_peak"]] = []prom.Result{res("inkling", "nimbus3", 2)}
+	f.instant[q["kv"]] = []prom.Result{res("inkling", "nimbus3", 0)}
+	f.instant[q["kv_peak"]] = []prom.Result{res("inkling", "nimbus3", 12.5)}
+	f.instant[q["gen"]] = []prom.Result{res("inkling", "nimbus3", 30)}
+	s.refreshLive()
+	ms := s.Models()
+	if len(ms) != 1 || ms[0].Live == nil {
+		t.Fatalf("want one live card, got %d", len(ms))
+	}
+	l := ms[0].Live
+	if ms[0].Status != "generating" {
+		t.Errorf("status = %s, want generating", ms[0].Status)
+	}
+	approx(t, "running", l.RequestsRunning, 1)
+	approx(t, "waiting", l.RequestsWaiting, 2)
+	if l.KVCachePercent == nil {
+		t.Fatal("kv = nil, want the 2-minute peak")
+	}
+	approx(t, "kv", *l.KVCachePercent, 12.5)
+
+	// A member that is no longer serving must not keep its peak on the card.
+	f.instant[q["running"]] = nil
+	s.refreshLive()
+	if ms = s.Models(); len(ms) == 1 && ms[0].Live != nil {
+		t.Errorf("stopped member still live: %+v", ms[0].Live)
+	}
+}

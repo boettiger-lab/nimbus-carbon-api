@@ -561,20 +561,28 @@ func quantilesIf(requests float64, v *float64) *float64 {
 func (s *Scraper) liveQueries() map[string]string {
 	c := s.cfg
 	return map[string]string{
-		"running":  c.vllm(`vllm:num_requests_running{%s}`),
-		"waiting":  c.vllm(`vllm:num_requests_waiting{%s}`),
-		"kv":       fmt.Sprintf(`avg by (%s) (vllm:kv_cache_usage_perc{%s}) * 100`, modelLabels, c.vllmSelector()),
-		"power":    c.attributedPower("5m", c.presence()),
-		"util":     c.attributedUtil("5m", c.presence()),
-		"prompt":   c.rate("vllm:prompt_tokens_total", "2m"),
-		"gen":      c.rate("vllm:generation_tokens_total", "2m"),
-		"itl":      c.rate("vllm:inter_token_latency_seconds_sum", "2m"),
-		"reqs":     c.rate("vllm:request_success_total", "15m") + " * 3600",
-		"hits":     c.rate("vllm:prefix_cache_hits_total", "15m"),
-		"lookups":  c.rate("vllm:prefix_cache_queries_total", "15m"),
-		"accepted": c.rate("vllm:spec_decode_num_accepted_tokens_total", "15m"),
-		"drafted":  c.rate("vllm:spec_decode_num_draft_tokens_total", "15m"),
-		"lastseen": fmt.Sprintf(`max by (%s) (timestamp(vllm:num_requests_running{%s}))`, modelLabels, c.vllmSelector()),
+		"running": c.vllm(`vllm:num_requests_running{%s}`),
+		"waiting": c.vllm(`vllm:num_requests_waiting{%s}`),
+		"kv":      fmt.Sprintf(`avg by (%s) (vllm:kv_cache_usage_perc{%s}) * 100`, modelLabels, c.vllmSelector()),
+		// The displayed run/wait/KV values are peaks over the same 2-minute
+		// window as the token rates that set "generating": a single-stream
+		// client reads 0/0 between requests on the instant gauges while its
+		// token rate still says it is generating. The instant "running"
+		// above still decides which members are live.
+		"running_peak": c.vllm(`max_over_time(vllm:num_requests_running{%s}[2m])`),
+		"waiting_peak": c.vllm(`max_over_time(vllm:num_requests_waiting{%s}[2m])`),
+		"kv_peak":      fmt.Sprintf(`avg by (%s) (max_over_time(vllm:kv_cache_usage_perc{%s}[2m])) * 100`, modelLabels, c.vllmSelector()),
+		"power":        c.attributedPower("5m", c.presence()),
+		"util":         c.attributedUtil("5m", c.presence()),
+		"prompt":       c.rate("vllm:prompt_tokens_total", "2m"),
+		"gen":          c.rate("vllm:generation_tokens_total", "2m"),
+		"itl":          c.rate("vllm:inter_token_latency_seconds_sum", "2m"),
+		"reqs":         c.rate("vllm:request_success_total", "15m") + " * 3600",
+		"hits":         c.rate("vllm:prefix_cache_hits_total", "15m"),
+		"lookups":      c.rate("vllm:prefix_cache_queries_total", "15m"),
+		"accepted":     c.rate("vllm:spec_decode_num_accepted_tokens_total", "15m"),
+		"drafted":      c.rate("vllm:spec_decode_num_draft_tokens_total", "15m"),
+		"lastseen":     fmt.Sprintf(`max by (%s) (timestamp(vllm:num_requests_running{%s}))`, modelLabels, c.vllmSelector()),
 	}
 }
 
@@ -582,7 +590,7 @@ func (s *Scraper) liveQueries() map[string]string {
 // serving members. Normally one member serves at a time and these never
 // matter; if two serve at once, their rates and power add, the fuller KV
 // cache is shown, and GPU utilisation is averaged.
-var liveKinds = map[string]merge{"kv": maxOf, "util": meanOf, "lastseen": maxOf}
+var liveKinds = map[string]merge{"kv": maxOf, "kv_peak": maxOf, "util": meanOf, "lastseen": maxOf}
 
 func (s *Scraper) refreshLive() {
 	r := s.batch(s.liveQueries())
@@ -627,7 +635,14 @@ func (s *Scraper) refreshLive() {
 
 // buildLive turns one card's merged live results into a Live.
 func buildLive(r map[string]map[string]float64, id string, intensity float64) *Live {
-	running := r["running"][id]
+	// Peak over 2 minutes, never below the instant reading (the peak series
+	// can lag a fresh server by a scrape).
+	running := math.Max(r["running"][id], r["running_peak"][id])
+	waiting := math.Max(r["waiting"][id], r["waiting_peak"][id])
+	kv := ptr(r["kv_peak"], id, 1)
+	if kv == nil {
+		kv = ptr(r["kv"], id, 1)
+	}
 	power := r["power"][id]
 	prompt, gen := r["prompt"][id], r["gen"][id]
 	l := &Live{
@@ -636,8 +651,8 @@ func buildLive(r map[string]map[string]float64, id string, intensity float64) *L
 		PromptTokensPerSec:     round(prompt, 1),
 		GenerationTokensPerSec: round(gen, 1),
 		RequestsRunning:        running,
-		RequestsWaiting:        r["waiting"][id],
-		KVCachePercent:         ptr(r["kv"], id, 1),
+		RequestsWaiting:        waiting,
+		KVCachePercent:         kv,
 		GPUUtilPercent:         ptr(r["util"], id, 1),
 		RequestsPerHour:        round(r["reqs"][id], 1),
 		TTFTP50Seconds:         quantilesIf(r["reqs"][id]/4, ptr(r["ttft50"], id, 3)),
